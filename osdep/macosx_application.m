@@ -1,26 +1,29 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdio.h>
 #include <pthread.h>
-#include "talloc.h"
+#include "config.h"
+#include "mpv_talloc.h"
 
 #include "common/msg.h"
 #include "input/input.h"
+#include "player/client.h"
+#include "options/m_config.h"
 
 #import "osdep/macosx_application_objc.h"
 #include "osdep/macosx_compat.h"
@@ -28,7 +31,34 @@
 #include "osdep/threads.h"
 #include "osdep/main-fn.h"
 
+#if HAVE_MACOS_TOUCHBAR
+#import "osdep/macosx_touchbar.h"
+#endif
+#if HAVE_MACOS_COCOA_CB
+#include "osdep/macOS_swift.h"
+#endif
+
 #define MPV_PROTOCOL @"mpv://"
+
+#define OPT_BASE_STRUCT struct macos_opts
+const struct m_sub_options macos_conf = {
+    .opts = (const struct m_option[]) {
+        OPT_CHOICE("macos-title-bar-style", macos_title_bar_style, 0,
+                   ({"dark", 0}, {"ultradark", 1}, {"light", 2},
+                    {"mediumlight", 3}, {"auto", 4})),
+        OPT_CHOICE_OR_INT("macos-fs-animation-duration",
+                          macos_fs_animation_duration, 0, 0, 1000,
+                          ({"default", -1})),
+        OPT_CHOICE("cocoa-cb-sw-renderer", cocoa_cb_sw_renderer, 0,
+                   ({"auto", -1}, {"no", 0}, {"yes", 1})),
+        {0}
+    },
+    .size = sizeof(struct macos_opts),
+    .defaults = &(const struct macos_opts){
+        .macos_fs_animation_duration = -1,
+        .cocoa_cb_sw_renderer = -1,
+    },
+};
 
 // Whether the NSApplication singleton was created. If this is false, we are
 // running in libmpv mode, and cocoa_main() was never called.
@@ -41,21 +71,6 @@ static pthread_t playback_thread_id;
     EventsResponder *_eventsResponder;
 }
 
-- (NSMenuItem *)menuItemWithParent:(NSMenu *)parent
-                             title:(NSString *)title
-                            action:(SEL)selector
-                     keyEquivalent:(NSString*)key;
-
-- (NSMenuItem *)mainMenuItemWithParent:(NSMenu *)parent
-                                 child:(NSMenu *)child;
-- (void)registerMenuItem:(NSMenuItem*)menuItem forKey:(MPMenuKey)key;
-- (NSMenu *)appleMenuWithMainMenu:(NSMenu *)mainMenu;
-- (NSMenu *)movieMenu;
-- (NSMenu *)windowMenu;
-@end
-
-@interface NSApplication (NiblessAdditions)
-- (void)setAppleMenu:(NSMenu *)aMenu;
 @end
 
 static Application *mpv_shared_app(void)
@@ -70,21 +85,20 @@ static void terminate_cocoa_application(void)
 }
 
 @implementation Application
-@synthesize menuItems = _menu_items;
+@synthesize menuBar = _menu_bar;
 @synthesize openCount = _open_count;
+@synthesize cocoaCB = _cocoa_cb;
 
 - (void)sendEvent:(NSEvent *)event
 {
-    [super sendEvent:event];
-
-    if (_eventsResponder.inputContext)
-        mp_input_wakeup(_eventsResponder.inputContext);
+    if ([self modalWindow] || ![_eventsResponder processKeyEvent:event])
+        [super sendEvent:event];
+    [_eventsResponder wakeup];
 }
 
 - (id)init
 {
     if (self = [super init]) {
-        self.menuItems = [[[NSMutableDictionary alloc] init] autorelease];
         _eventsResponder = [EventsResponder sharedInstance];
 
         NSAppleEventManager *em = [NSAppleEventManager sharedAppleEventManager];
@@ -102,127 +116,91 @@ static void terminate_cocoa_application(void)
     NSAppleEventManager *em = [NSAppleEventManager sharedAppleEventManager];
     [em removeEventHandlerForEventClass:kInternetEventClass
                              andEventID:kAEGetURL];
+    [em removeEventHandlerForEventClass:kCoreEventClass
+                             andEventID:kAEQuitApplication];
     [super dealloc];
 }
 
-#define _R(P, T, E, K) \
-    { \
-        NSMenuItem *tmp = [self menuItemWithParent:(P) title:(T) \
-                                            action:nil keyEquivalent:(E)]; \
-        [self registerMenuItem:tmp forKey:(K)]; \
+static const char macosx_icon[] =
+#include "osdep/macosx_icon.inc"
+;
+
+- (NSImage *)getMPVIcon
+{
+    // The C string contains a trailing null, so we strip it away
+    NSData *icon_data = [NSData dataWithBytesNoCopy:(void *)macosx_icon
+                                             length:sizeof(macosx_icon) - 1
+                                       freeWhenDone:NO];
+    return [[NSImage alloc] initWithData:icon_data];
+}
+
+#if HAVE_MACOS_TOUCHBAR
+- (NSTouchBar *)makeTouchBar
+{
+    TouchBar *tBar = [[TouchBar alloc] init];
+    [tBar setApp:self];
+    tBar.delegate = tBar;
+    tBar.customizationIdentifier = customID;
+    tBar.defaultItemIdentifiers = @[play, previousItem, nextItem, seekBar];
+    tBar.customizationAllowedItemIdentifiers = @[play, seekBar, previousItem,
+        nextItem, previousChapter, nextChapter, cycleAudio, cycleSubtitle,
+        currentPosition, timeLeft];
+    return tBar;
+}
+#endif
+
+- (void)processEvent:(struct mpv_event *)event
+{
+#if HAVE_MACOS_TOUCHBAR
+    if ([self respondsToSelector:@selector(touchBar)])
+        [(TouchBar *)self.touchBar processEvent:event];
+#endif
+    if (_cocoa_cb) {
+        [_cocoa_cb processEvent:event];
     }
-
-- (NSMenu *)appleMenuWithMainMenu:(NSMenu *)mainMenu
-{
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Apple Menu"];
-    [self mainMenuItemWithParent:mainMenu child:menu];
-    [self menuItemWithParent:menu title:@"Hide mpv"
-                      action:@selector(hide:) keyEquivalent: @"h"];
-    [self menuItemWithParent:menu title:@"Quit mpv"
-                      action:@selector(stopPlayback) keyEquivalent: @"q"];
-    [self menuItemWithParent:menu title:@"Quit mpv & remember position"
-                      action:@selector(stopPlaybackAndRememberPosition)
-               keyEquivalent: @"Q"];
-    return [menu autorelease];
 }
 
-- (NSMenu *)movieMenu
+- (void)setMpvHandle:(struct mpv_handle *)ctx
 {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Movie"];
-    _R(menu, @"Half Size",   @"0", MPM_H_SIZE)
-    _R(menu, @"Normal Size", @"1", MPM_N_SIZE)
-    _R(menu, @"Double Size", @"2", MPM_D_SIZE)
-    return [menu autorelease];
+#if HAVE_MACOS_COCOA_CB
+    [NSApp setCocoaCB:[[CocoaCB alloc] init:ctx]];
+#endif
 }
 
-- (NSMenu *)windowMenu
+- (const struct m_sub_options *)getMacOSConf
 {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Window"];
-    _R(menu, @"Minimize", @"m", MPM_MINIMIZE)
-    _R(menu, @"Zoom",     @"z", MPM_ZOOM)
-    return [menu autorelease];
+    return &macos_conf;
 }
 
-- (void)initialize_menu
+- (void)queueCommand:(char *)cmd
 {
-    NSMenu *main_menu = [[NSMenu new] autorelease];
-    [NSApp setMainMenu:main_menu];
-    [NSApp setAppleMenu:[self appleMenuWithMainMenu:main_menu]];
-
-    [NSApp mainMenuItemWithParent:main_menu child:[self movieMenu]];
-    [NSApp mainMenuItemWithParent:main_menu child:[self windowMenu]];
-}
-
-#undef _R
-
-- (void)stopPlayback
-{
-    [self stopMPV:"quit"];
-}
-
-- (void)stopPlaybackAndRememberPosition
-{
-    [self stopMPV:"quit_watch_later"];
+    [_eventsResponder queueCommand:cmd];
 }
 
 - (void)stopMPV:(char *)cmd
 {
-    struct input_ctx *inputContext = _eventsResponder.inputContext;
-    if (inputContext) {
-        mp_cmd_t *cmdt = mp_input_parse_cmd(inputContext, bstr0(cmd), "");
-        mp_input_queue_cmd(inputContext, cmdt);
-    } else {
+    if (![_eventsResponder queueCommand:cmd])
         terminate_cocoa_application();
-    }
 }
 
-
-- (void)registerMenuItem:(NSMenuItem*)menuItem forKey:(MPMenuKey)key
+- (void)applicationWillFinishLaunching:(NSNotification *)notification
 {
-    [self.menuItems setObject:menuItem forKey:[NSNumber numberWithInt:key]];
+    NSAppleEventManager *em = [NSAppleEventManager sharedAppleEventManager];
+    [em setEventHandler:self
+            andSelector:@selector(handleQuitEvent:withReplyEvent:)
+          forEventClass:kCoreEventClass
+             andEventID:kAEQuitApplication];
 }
 
-- (void)registerSelector:(SEL)action forKey:(MPMenuKey)key
+- (void)applicationWillBecomeActive:(NSNotification *)notification
 {
-    NSNumber *boxedKey = [NSNumber numberWithInt:key];
-    NSMenuItem *item   = [self.menuItems objectForKey:boxedKey];
-    if (item) {
-        [item setAction:action];
-    }
+    [_eventsResponder setHighestPriotityMediaKeysTap];
 }
 
-- (NSMenuItem *)menuItemWithParent:(NSMenu *)parent
-                             title:(NSString *)title
-                            action:(SEL)action
-                     keyEquivalent:(NSString*)key
+- (void)handleQuitEvent:(NSAppleEventDescriptor *)event
+         withReplyEvent:(NSAppleEventDescriptor *)replyEvent
 {
-
-    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title
-                                                  action:action
-                                           keyEquivalent:key];
-    [parent addItem:item];
-    return [item autorelease];
-}
-
-- (NSMenuItem *)mainMenuItemWithParent:(NSMenu *)parent
-                                 child:(NSMenu *)child
-{
-    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@""
-                                                  action:nil
-                                           keyEquivalent:@""];
-    [item setSubmenu:child];
-    [parent addItem:item];
-    return [item autorelease];
-}
-
-- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)theApp {
-    return NSTerminateNow;
-}
-
-- (void)handleQuitEvent:(NSAppleEventDescriptor*)e
-         withReplyEvent:(NSAppleEventDescriptor*)r
-{
-    [self stopPlayback];
+    [self stopMPV:"quit"];
 }
 
 - (void)getUrl:(NSAppleEventDescriptor *)event
@@ -246,6 +224,11 @@ static void terminate_cocoa_application(void)
         mpv_shared_app().openCount--;
         return;
     }
+    [self openFiles:filenames];
+}
+
+- (void)openFiles:(NSArray *)filenames
+{
     SEL cmpsel = @selector(localizedStandardCompare:);
     NSArray *files = [filenames sortedArrayUsingSelector:cmpsel];
     [_eventsResponder handleFilesArray:files];
@@ -279,14 +262,14 @@ static void *playback_thread(void *ctx_obj)
 void cocoa_register_menu_item_action(MPMenuKey key, void* action)
 {
     if (application_instantiated)
-        [NSApp registerSelector:(SEL)action forKey:key];
+        [[NSApp menuBar] registerSelector:(SEL)action forKey:key];
 }
 
 static void init_cocoa_application(bool regular)
 {
     NSApp = mpv_shared_app();
     [NSApp setDelegate:NSApp];
-    [NSApp initialize_menu];
+    [NSApp setMenuBar:[[MenuBar alloc] init]];
 
     // Will be set to Regular from cocoa_common during UI creation so that we
     // don't create an icon when playing audio only files.
@@ -312,69 +295,49 @@ static void macosx_redirect_output_to_logfile(const char *filename)
     [pool release];
 }
 
-static void get_system_version(int* major, int* minor, int* bugfix)
+static bool bundle_started_from_finder(char **argv)
 {
-    static dispatch_once_t once_token;
-    static int s_major  = 0;
-    static int s_minor  = 0;
-    static int s_bugfix = 0;
-    dispatch_once(&once_token, ^{
-        NSString *version_plist =
-            @"/System/Library/CoreServices/SystemVersion.plist";
-        NSString *version_string =
-            [NSDictionary dictionaryWithContentsOfFile:version_plist]
-                [@"ProductVersion"];
-        NSArray* versions = [version_string componentsSeparatedByString:@"."];
-        int count = [versions count];
-        if (count >= 1)
-            s_major = [versions[0] intValue];
-        if (count >= 2)
-            s_minor = [versions[1] intValue];
-        if (count >= 3)
-            s_bugfix = [versions[2] intValue];
-    });
-    *major  = s_major;
-    *minor  = s_minor;
-    *bugfix = s_bugfix;
+    NSString *binary_path = [NSString stringWithUTF8String:argv[0]];
+    return [binary_path hasSuffix:@"mpv-bundle"];
 }
 
-static bool is_psn_argument(char *psn_arg_to_check)
+static bool is_psn_argument(char *arg_to_check)
 {
-    NSString *psn_arg = [NSString stringWithUTF8String:psn_arg_to_check];
-    return [psn_arg hasPrefix:@"-psn_"];
+    NSString *arg = [NSString stringWithUTF8String:arg_to_check];
+    return [arg hasPrefix:@"-psn_"];
 }
 
-static bool bundle_started_from_finder(int argc, char **argv)
+static void setup_bundle(int *argc, char *argv[])
 {
-    bool bundle_detected = [[NSBundle mainBundle] bundleIdentifier];
-    int major, minor, bugfix;
-    get_system_version(&major, &minor, &bugfix);
-    bool without_psn = bundle_detected && argc==1;
-    bool with_psn    = bundle_detected && argc==2 && is_psn_argument(argv[1]);
-
-    if ((major == 10) && (minor >= 9)) {
-        // Looks like opening quarantined files from the finder inserts the
-        // -psn argument while normal files do not. Hurr.
-        return with_psn || without_psn;
-    } else {
-        return with_psn;
+    if (*argc > 1 && is_psn_argument(argv[1])) {
+        *argc = 1;
+        argv[1] = NULL;
     }
+
+    NSDictionary *env = [[NSProcessInfo processInfo] environment];
+    NSString *path_bundle = [env objectForKey:@"PATH"];
+    NSString *path_new = [NSString stringWithFormat:@"%@:%@:%@:%@:%@",
+                                                    path_bundle,
+                                                    @"/usr/local/bin",
+                                                    @"/usr/local/sbin",
+                                                    @"/opt/local/bin",
+                                                    @"/opt/local/sbin"];
+    setenv("PATH", [path_new UTF8String], 1);
+    setenv("MPVBUNDLE", "true", 1);
 }
 
 int cocoa_main(int argc, char *argv[])
 {
     @autoreleasepool {
         application_instantiated = true;
+        [[EventsResponder sharedInstance] setIsApplication:YES];
 
         struct playback_thread_ctx ctx = {0};
         ctx.argc     = &argc;
         ctx.argv     = &argv;
 
-        if (bundle_started_from_finder(argc, argv)) {
-            if (argc > 1) {
-                argc = 1; // clears out -psn argument if present
-                argv[1] = NULL;
-            }
+        if (bundle_started_from_finder(argv)) {
+            setup_bundle(&argc, argv);
             macosx_redirect_output_to_logfile("mpv");
             init_cocoa_application(true);
         } else {

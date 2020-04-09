@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stddef.h>
@@ -30,7 +30,7 @@
 
 #include "osdep/timer.h"
 #include "osdep/threads.h"
-#include "osdep/atomics.h"
+#include "osdep/atomic.h"
 #include "misc/ring.h"
 
 /*
@@ -55,8 +55,17 @@ struct ao_pull_state {
     // AO_STATE_*
     atomic_int state;
 
+    // Set when the buffer is intentionally not fed anymore in PLAY state.
+    atomic_bool draining;
+
+    // Set by the audio thread when an underflow was detected.
+    // It adds the number of samples.
+    atomic_int underflow;
+
     // Device delay of the last written sample, in realtime.
     atomic_llong end_time_us;
+
+    char *convert_buffer;
 };
 
 static void set_state(struct ao *ao, int new_state)
@@ -100,9 +109,19 @@ static int play(struct ao *ao, void **data, int samples, int flags)
 
     int state = atomic_load(&p->state);
     if (!IS_PLAYING(state)) {
+        atomic_store(&p->draining, false);
+        atomic_store(&p->underflow, 0);
         set_state(ao, AO_STATE_PLAY);
-        ao->driver->resume(ao);
+        if (!ao->stream_silence)
+            ao->driver->resume(ao);
     }
+
+    bool draining = write_samples == samples && (flags & AOPLAY_FINAL_CHUNK);
+    atomic_store(&p->draining, draining);
+
+    int underflow = atomic_fetch_and(&p->underflow, 0);
+    if (underflow)
+        MP_WARN(ao, "Audio underflow by %d samples.\n", underflow);
 
     return write_samples;
 }
@@ -113,7 +132,7 @@ static int play(struct ao *ao, void **data, int samples, int flags)
 // rest of the user-provided buffer with silence.
 // This basically assumes that the audio device doesn't care about underruns.
 // If this is called in paused mode, it will always return 0.
-// The caller should set out_time_us to the expected delay the last sample
+// The caller should set out_time_us to the expected delay until the last sample
 // reaches the speakers, in microseconds, using mp_time_us() as reference.
 int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_us)
 {
@@ -134,6 +153,9 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_us)
     int buffered_bytes = mp_ring_buffered(p->buffers[0]);
     bytes = MPMIN(buffered_bytes, full_bytes);
 
+    if (buffered_bytes < bytes && !atomic_load(&p->draining))
+        atomic_fetch_add(&p->underflow, (bytes - buffered_bytes) / ao->sstride);
+
     if (bytes > 0)
         atomic_store(&p->end_time_us, out_time_us);
 
@@ -151,13 +173,55 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_us)
 end:
 
     if (need_wakeup)
-        mp_input_wakeup_nolock(ao->input_ctx);
+        ao->wakeup_cb(ao->wakeup_ctx);
 
     // pad with silence (underflow/paused/eof)
     for (int n = 0; n < ao->num_planes; n++)
-        af_fill_silence(data[n], full_bytes - bytes, ao->format);
+        af_fill_silence((char *)data[n] + bytes, full_bytes - bytes, ao->format);
+
+    ao_post_process_data(ao, data, samples);
 
     return bytes / ao->sstride;
+}
+
+// Same as ao_read_data(), but convert data according to *fmt.
+// fmt->src_fmt and fmt->channels must be the same as the AO parameters.
+int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
+                           void **data, int samples, int64_t out_time_us)
+{
+    assert(ao->api == &ao_api_pull);
+
+    struct ao_pull_state *p = ao->api_priv;
+    void *ndata[MP_NUM_CHANNELS] = {0};
+
+    if (!ao_need_conversion(fmt))
+        return ao_read_data(ao, data, samples, out_time_us);
+
+    assert(ao->format == fmt->src_fmt);
+    assert(ao->channels.num == fmt->channels);
+
+    bool planar = af_fmt_is_planar(fmt->src_fmt);
+    int planes = planar ? fmt->channels : 1;
+    int plane_samples = samples * (planar ? 1: fmt->channels);
+    int src_plane_size = plane_samples * af_fmt_to_bytes(fmt->src_fmt);
+    int dst_plane_size = plane_samples * fmt->dst_bits / 8;
+
+    int needed = src_plane_size * planes;
+    if (needed > talloc_get_size(p->convert_buffer) || !p->convert_buffer) {
+        talloc_free(p->convert_buffer);
+        p->convert_buffer = talloc_size(NULL, needed);
+    }
+
+    for (int n = 0; n < planes; n++)
+        ndata[n] = p->convert_buffer + n * src_plane_size;
+
+    int res = ao_read_data(ao, ndata, samples, out_time_us);
+
+    ao_convert_inplace(fmt, ndata, samples);
+    for (int n = 0; n < planes; n++)
+        memcpy(data[n], ndata[n], dst_plane_size);
+
+    return res;
 }
 
 static int control(struct ao *ao, enum aocontrol cmd, void *arg)
@@ -185,7 +249,7 @@ static double get_delay(struct ao *ao)
 static void reset(struct ao *ao)
 {
     struct ao_pull_state *p = ao->api_priv;
-    if (ao->driver->reset)
+    if (!ao->stream_silence && ao->driver->reset)
         ao->driver->reset(ao); // assumes the audio callback thread is stopped
     set_state(ao, AO_STATE_NONE);
     for (int n = 0; n < ao->num_planes; n++)
@@ -195,7 +259,7 @@ static void reset(struct ao *ao)
 
 static void pause(struct ao *ao)
 {
-    if (ao->driver->reset)
+    if (!ao->stream_silence && ao->driver->reset)
         ao->driver->reset(ao);
     set_state(ao, AO_STATE_NONE);
 }
@@ -203,16 +267,8 @@ static void pause(struct ao *ao)
 static void resume(struct ao *ao)
 {
     set_state(ao, AO_STATE_PLAY);
-    ao->driver->resume(ao);
-}
-
-static void drain(struct ao *ao)
-{
-    struct ao_pull_state *p = ao->api_priv;
-    int state = atomic_load(&p->state);
-    if (IS_PLAYING(state))
-        mp_sleep_us(get_delay(ao) * 1000000);
-    reset(ao);
+    if (!ao->stream_silence)
+        ao->driver->resume(ao);
 }
 
 static bool get_eof(struct ao *ao)
@@ -223,9 +279,32 @@ static bool get_eof(struct ao *ao)
     return mp_ring_buffered(p->buffers[0]) == 0;
 }
 
+static void drain(struct ao *ao)
+{
+    struct ao_pull_state *p = ao->api_priv;
+    int state = atomic_load(&p->state);
+    if (IS_PLAYING(state)) {
+        atomic_store(&p->draining, true);
+        // Wait for lower bound.
+        mp_sleep_us(mp_ring_buffered(p->buffers[0]) / (double)ao->bps * 1e6);
+        // And then poll for actual end. (Unfortunately, this code considers
+        // audio APIs which do not want you to use mutexes in the audio
+        // callback, and an extra semaphore would require slightly more effort.)
+        // Limit to arbitrary ~250ms max. waiting for robustness.
+        int64_t max = mp_time_us() + 250000;
+        while (mp_time_us() < max && !get_eof(ao))
+            mp_sleep_us(1);
+    }
+    reset(ao);
+}
+
 static void uninit(struct ao *ao)
 {
+    struct ao_pull_state *p = ao->api_priv;
+
     ao->driver->uninit(ao);
+
+    talloc_free(p->convert_buffer);
 }
 
 static int init(struct ao *ao)
@@ -235,6 +314,10 @@ static int init(struct ao *ao)
         p->buffers[n] = mp_ring_new(ao, ao->buffer * ao->sstride);
     atomic_store(&p->state, AO_STATE_NONE);
     assert(ao->driver->resume);
+
+    if (ao->stream_silence)
+        ao->driver->resume(ao);
+
     return 0;
 }
 

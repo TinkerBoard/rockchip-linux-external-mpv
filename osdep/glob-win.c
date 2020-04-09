@@ -1,25 +1,32 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <windows.h>
 #include <stdbool.h>
 #include <string.h>
 #include "osdep/io.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
+
+#if HAVE_UWP
+// Missing from MinGW headers.
+WINBASEAPI HANDLE WINAPI FindFirstFileExW(LPCWSTR lpFileName,
+    FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData,
+    FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags);
+#endif
 
 static wchar_t *talloc_wcsdup(void *ctx, const wchar_t *wcs)
 {
@@ -88,7 +95,7 @@ int mp_glob(const char *restrict pattern, int flags,
 
     wchar_t *wpattern = mp_from_utf8(NULL, pattern);
     WIN32_FIND_DATAW data;
-    HANDLE find = FindFirstFileW(wpattern, &data);
+    HANDLE find = FindFirstFileExW(wpattern, FindExInfoBasic, &data, FindExSearchNameMatch, NULL, 0);
     talloc_free(wpattern);
 
     // Assume an error means there were no matches. mpv doesn't check for

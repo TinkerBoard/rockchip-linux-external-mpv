@@ -42,6 +42,11 @@
 #include "common/msg.h"
 #include "input/input.h"
 
+#include "config.h"
+#if !HAVE_GPL
+#error GPL only
+#endif
+
 struct priv {
     caca_canvas_t  *canvas;
     caca_display_t *display;
@@ -96,7 +101,7 @@ static int resize(struct vo *vo)
     return 0;
 }
 
-static int reconfig(struct vo *vo, struct mp_image_params *params, int flags)
+static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *priv = vo->priv;
     priv->image_height = params->h;
@@ -179,11 +184,11 @@ static void check_events(struct vo *vo)
             break;
         case CACA_EVENT_MOUSE_PRESS:
             mp_input_put_key(vo->input_ctx,
-                    (MP_MOUSE_BTN0 + cev.data.mouse.button - 1) | MP_KEY_STATE_DOWN);
+                    (MP_MBTN_BASE + cev.data.mouse.button - 1) | MP_KEY_STATE_DOWN);
             break;
         case CACA_EVENT_MOUSE_RELEASE:
             mp_input_put_key(vo->input_ctx,
-                    (MP_MOUSE_BTN0 + cev.data.mouse.button - 1) | MP_KEY_STATE_UP);
+                    (MP_MBTN_BASE + cev.data.mouse.button - 1) | MP_KEY_STATE_UP);
             break;
         case CACA_EVENT_KEY_PRESS:
         {

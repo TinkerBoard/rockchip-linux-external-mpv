@@ -1,21 +1,21 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <spawn.h>
+#include "osdep/posix-spawn.h"
 #include <poll.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -30,9 +30,9 @@
 #include "common/common.h"
 #include "stream/stream.h"
 
-// Normally, this must be declared manually, but glibc is retarded
-// resulting in a warning.
 extern char **environ;
+
+#define SAFE_CLOSE(fd) do { if ((fd) >= 0) close((fd)); (fd) = -1; } while (0)
 
 // A silly helper: automatically skips entries with negative FDs
 static int sparse_poll(struct pollfd *fds, int num_fds, int timeout)
@@ -66,6 +66,8 @@ int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
     int p_stderr[2] = {-1, -1};
     int devnull = -1;
     pid_t pid = -1;
+    bool spawned = false;
+    bool killed_by_us = false;
 
     if (on_stdout && mp_make_cloexec_pipe(p_stdout) < 0)
         goto done;
@@ -91,13 +93,11 @@ int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
         pid = -1;
         goto done;
     }
+    spawned = true;
 
-    close(p_stdout[1]);
-    p_stdout[1] = -1;
-    close(p_stderr[1]);
-    p_stderr[1] = -1;
-    close(devnull);
-    devnull = -1;
+    SAFE_CLOSE(p_stdout[1]);
+    SAFE_CLOSE(p_stderr[1]);
+    SAFE_CLOSE(devnull);
 
     int *read_fds[2] = {&p_stdout[0], &p_stderr[0]};
     subprocess_read_cb read_cbs[2] = {on_stdout, on_stderr};
@@ -118,14 +118,13 @@ int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
                     continue;
                 if (r > 0 && read_cbs[n])
                     read_cbs[n](ctx, buf, r);
-                if (r <= 0) {
-                    close(*read_fds[n]);
-                    *read_fds[n] = -1;
-                }
+                if (r <= 0)
+                    SAFE_CLOSE(*read_fds[n]);
             }
         }
         if (fds[2].revents) {
             kill(pid, SIGKILL);
+            killed_by_us = true;
             break;
         }
     }
@@ -139,18 +138,21 @@ int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
 done:
     if (fa_destroy)
         posix_spawn_file_actions_destroy(&fa);
-    close(p_stdout[0]);
-    close(p_stdout[1]);
-    close(p_stderr[0]);
-    close(p_stderr[1]);
-    close(devnull);
+    SAFE_CLOSE(p_stdout[0]);
+    SAFE_CLOSE(p_stdout[1]);
+    SAFE_CLOSE(p_stderr[0]);
+    SAFE_CLOSE(p_stderr[1]);
+    SAFE_CLOSE(devnull);
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 127) {
+    if (!spawned || (WIFEXITED(status) && WEXITSTATUS(status) == 127)) {
+        *error = "init";
+        status = -1;
+    } else if (WIFEXITED(status)) {
         *error = NULL;
         status = WEXITSTATUS(status);
     } else {
-        *error = WEXITSTATUS(status) == 127 ? "init" : "killed";
-        status = -1;
+        *error = "killed";
+        status = killed_by_us ? MP_SUBPROCESS_EKILLED_BY_US : -1;
     }
 
     return status;

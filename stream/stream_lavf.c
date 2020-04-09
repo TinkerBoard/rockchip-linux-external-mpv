@@ -1,48 +1,74 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
 #include <libavutil/opt.h>
 
-#include "options/options.h"
 #include "options/path.h"
+#include "common/common.h"
 #include "common/msg.h"
 #include "common/tags.h"
 #include "common/av_common.h"
 #include "stream.h"
+#include "options/m_config.h"
 #include "options/m_option.h"
 
 #include "cookies.h"
 
 #include "misc/bstr.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #define OPT_BASE_STRUCT struct stream_lavf_params
 struct stream_lavf_params {
     char **avopts;
+    int cookies_enabled;
+    char *cookies_file;
+    char *useragent;
+    char *referrer;
+    char **http_header_fields;
+    int tls_verify;
+    char *tls_ca_file;
+    char *tls_cert_file;
+    char *tls_key_file;
+    double timeout;
+    char *http_proxy;
 };
 
 const struct m_sub_options stream_lavf_conf = {
     .opts = (const m_option_t[]) {
         OPT_KEYVALUELIST("stream-lavf-o", avopts, 0),
+        OPT_STRINGLIST("http-header-fields", http_header_fields, 0),
+        OPT_STRING("user-agent", useragent, 0),
+        OPT_STRING("referrer", referrer, 0),
+        OPT_FLAG("cookies", cookies_enabled, 0),
+        OPT_STRING("cookies-file", cookies_file, M_OPT_FILE),
+        OPT_FLAG("tls-verify", tls_verify, 0),
+        OPT_STRING("tls-ca-file", tls_ca_file, M_OPT_FILE),
+        OPT_STRING("tls-cert-file", tls_cert_file, M_OPT_FILE),
+        OPT_STRING("tls-key-file", tls_key_file, M_OPT_FILE),
+        OPT_DOUBLE("network-timeout", timeout, M_OPT_MIN, .min = 0),
+        OPT_STRING("http-proxy", http_proxy, 0),
         {0}
     },
     .size = sizeof(struct stream_lavf_params),
+    .defaults = &(const struct stream_lavf_params){
+        .useragent = (char *)mpv_version,
+    },
 };
 
 static const char *const http_like[];
@@ -53,17 +79,17 @@ static struct mp_tags *read_icy(stream_t *stream);
 static int fill_buffer(stream_t *s, char *buffer, int max_len)
 {
     AVIOContext *avio = s->priv;
-    if (!avio)
-        return -1;
+#if LIBAVFORMAT_VERSION_MICRO >= 100 && LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 81, 100)
+    int r = avio_read_partial(avio, buffer, max_len);
+#else
     int r = avio_read(avio, buffer, max_len);
+#endif
     return (r <= 0) ? -1 : r;
 }
 
 static int write_buffer(stream_t *s, char *buffer, int len)
 {
     AVIOContext *avio = s->priv;
-    if (!avio)
-        return -1;
     avio_write(avio, buffer, len);
     avio_flush(avio);
     if (avio->error)
@@ -74,8 +100,6 @@ static int write_buffer(stream_t *s, char *buffer, int len)
 static int seek(stream_t *s, int64_t newpos)
 {
     AVIOContext *avio = s->priv;
-    if (!avio)
-        return -1;
     if (avio_seek(avio, newpos, SEEK_SET) < 0) {
         return 0;
     }
@@ -97,8 +121,6 @@ static void close_f(stream_t *stream)
 static int control(stream_t *s, int cmd, void *arg)
 {
     AVIOContext *avio = s->priv;
-    if (!avio && cmd != STREAM_CTRL_RECONNECT)
-        return -1;
     int64_t size;
     switch(cmd) {
     case STREAM_CTRL_GET_SIZE:
@@ -117,25 +139,35 @@ static int control(stream_t *s, int cmd, void *arg)
         }
         break;
     }
-    case STREAM_CTRL_HAS_AVSEEK:
-        if (avio->read_seek)
-            return 1;
+    case STREAM_CTRL_HAS_AVSEEK: {
+        // Starting at some point, read_seek is always available, and runtime
+        // behavior decides whether it exists or not. FFmpeg's API doesn't
+        // return anything helpful to determine seekability upfront, so here's
+        // a hardcoded whitelist. Not our fault.
+        // In addition we also have to jump through ridiculous hoops just to
+        // get the fucking protocol name.
+        const char *proto = NULL;
+        if (avio->av_class && avio->av_class->child_next) {
+            // This usually yields the URLContext (why does it even exist?),
+            // which holds the name of the actual protocol implementation.
+            void *child = avio->av_class->child_next(avio, NULL);
+            AVClass *cl = *(AVClass **)child;
+            if (cl && cl->item_name)
+                proto = cl->item_name(child);
+        }
+        static const char *const has_read_seek[] = {
+            "rtmp", "rtmpt", "rtmpe", "rtmpte", "rtmps", "rtmpts", "mmsh", 0};
+        for (int n = 0; has_read_seek[n]; n++) {
+            if (avio->read_seek && proto && strcmp(proto, has_read_seek[n]) == 0)
+                return 1;
+        }
         break;
+    }
     case STREAM_CTRL_GET_METADATA: {
         *(struct mp_tags **)arg = read_icy(s);
         if (!*(struct mp_tags **)arg)
             break;
         return 1;
-    }
-    case STREAM_CTRL_RECONNECT: {
-        if (avio && avio->write_flag)
-            break; // don't bother with this
-        // avio doesn't seem to support this - emulate it by reopening
-        close_f(s);
-        s->priv = NULL;
-        stream_drop_buffers(s);
-        s->pos = 0;
-        return open_f(s);
     }
     }
     return STREAM_UNSUPPORTED;
@@ -150,46 +182,54 @@ static int interrupt_cb(void *ctx)
 static const char * const prefix[] = { "lavf://", "ffmpeg://" };
 
 void mp_setup_av_network_options(AVDictionary **dict, struct mpv_global *global,
-                                 struct mp_log *log, struct MPOpts *opts)
+                                 struct mp_log *log)
 {
     void *temp = talloc_new(NULL);
+    struct stream_lavf_params *opts =
+        mp_get_config_group(temp, global, &stream_lavf_conf);
 
     // HTTP specific options (other protocols ignore them)
-    if (opts->network_useragent)
-        av_dict_set(dict, "user-agent", opts->network_useragent, 0);
-    if (opts->network_cookies_enabled) {
-        char *file = opts->network_cookies_file;
+    if (opts->useragent)
+        av_dict_set(dict, "user_agent", opts->useragent, 0);
+    if (opts->cookies_enabled) {
+        char *file = opts->cookies_file;
         if (file && file[0])
             file = mp_get_user_path(temp, global, file);
         char *cookies = cookies_lavf(temp, log, file);
         if (cookies && cookies[0])
             av_dict_set(dict, "cookies", cookies, 0);
     }
-    av_dict_set(dict, "tls_verify", opts->network_tls_verify ? "1" : "0", 0);
-    if (opts->network_tls_ca_file)
-        av_dict_set(dict, "ca_file", opts->network_tls_ca_file, 0);
+    av_dict_set(dict, "tls_verify", opts->tls_verify ? "1" : "0", 0);
+    if (opts->tls_ca_file)
+        av_dict_set(dict, "ca_file", opts->tls_ca_file, 0);
+    if (opts->tls_cert_file)
+        av_dict_set(dict, "cert_file", opts->tls_cert_file, 0);
+    if (opts->tls_key_file)
+        av_dict_set(dict, "key_file", opts->tls_key_file, 0);
     char *cust_headers = talloc_strdup(temp, "");
-    if (opts->network_referrer) {
+    if (opts->referrer) {
         cust_headers = talloc_asprintf_append(cust_headers, "Referer: %s\r\n",
-                                              opts->network_referrer);
+                                              opts->referrer);
     }
-    if (opts->network_http_header_fields) {
-        for (int n = 0; opts->network_http_header_fields[n]; n++) {
+    if (opts->http_header_fields) {
+        for (int n = 0; opts->http_header_fields[n]; n++) {
             cust_headers = talloc_asprintf_append(cust_headers, "%s\r\n",
-                                                  opts->network_http_header_fields[n]);
+                                                  opts->http_header_fields[n]);
         }
     }
     if (strlen(cust_headers))
         av_dict_set(dict, "headers", cust_headers, 0);
     av_dict_set(dict, "icy", "1", 0);
     // So far, every known protocol uses microseconds for this
-    if (opts->network_timeout > 0) {
+    if (opts->timeout > 0) {
         char buf[80];
-        snprintf(buf, sizeof(buf), "%lld", (long long)(opts->network_timeout * 1e6));
+        snprintf(buf, sizeof(buf), "%lld", (long long)(opts->timeout * 1e6));
         av_dict_set(dict, "timeout", buf, 0);
     }
+    if (opts->http_proxy && opts->http_proxy[0])
+        av_dict_set(dict, "http_proxy", opts->http_proxy, 0);
 
-    mp_set_avdict(dict, opts->stream_lavf_opts->avopts);
+    mp_set_avdict(dict, opts->avopts);
 
     talloc_free(temp);
 }
@@ -211,7 +251,6 @@ static char *normalize_url(void *ta_parent, const char *filename)
 
 static int open_f(stream_t *stream)
 {
-    struct MPOpts *opts = stream->opts;
     AVIOContext *avio = NULL;
     int res = STREAM_ERROR;
     AVDictionary *dict = NULL;
@@ -242,7 +281,6 @@ static int open_f(stream_t *stream)
         talloc_free(temp);
         return STREAM_OK;
     }
-    MP_VERBOSE(stream, "Opening %s\n", filename);
 
     // Replace "mms://" with "mmsh://", so that most mms:// URLs just work.
     bstr b_filename = bstr0(filename);
@@ -252,7 +290,10 @@ static int open_f(stream_t *stream)
         filename = talloc_asprintf(temp, "mmsh://%.*s", BSTR_P(b_filename));
     }
 
-    mp_setup_av_network_options(&dict, stream->global, stream->log, opts);
+    av_dict_set(&dict, "reconnect", "1", 0);
+    av_dict_set(&dict, "reconnect_delay_max", "7", 0);
+
+    mp_setup_av_network_options(&dict, stream->global, stream->log);
 
     AVIOInterruptCB cb = {
         .callback = interrupt_cb,
@@ -287,7 +328,7 @@ static int open_f(stream_t *stream)
     }
 
     stream->priv = avio;
-    stream->seekable = avio->seekable;
+    stream->seekable = avio->seekable & AVIO_SEEKABLE_NORMAL;
     stream->seek = stream->seekable ? seek : NULL;
     stream->fill_buffer = fill_buffer;
     stream->write_buffer = write_buffer;
@@ -367,7 +408,8 @@ const stream_info_t stream_info_ffmpeg = {
   .open = open_f,
   .protocols = (const char *const[]){
      "rtmp", "rtsp", "http", "https", "mms", "mmst", "mmsh", "mmshttp", "rtp",
-     "httpproxy", "hls", "rtmpe", "rtmps", "rtmpt", "rtmpte", "rtmpts", "srtp",
+     "httpproxy", "rtmpe", "rtmps", "rtmpt", "rtmpte", "rtmpts", "srtp",
+     "data",
      NULL },
   .can_write = true,
   .is_safe = true,

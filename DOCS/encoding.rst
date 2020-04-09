@@ -3,8 +3,7 @@ General usage
 
 ::
 
-  mpv infile -o outfile [-of outfileformat] [-ofopts formatoptions] \
-    [-ofps outfps | -oautofps] [-oharddup] [-ocopyts | -orawts] [-oneverdrop] \
+  mpv infile -o outfile [-of outfileformat] [-ofopts formatoptions] [-orawts] \
     [(any other mpv options)] \
     -ovc outvideocodec [-ovcopts outvideocodecoptions] \
     -oac outaudiocodec [-oacopts outaudiocodecoptions]
@@ -60,13 +59,13 @@ for.
 Typical MPEG-4 Part 2 ("ASP", "DivX") encoding, AVI container::
 
   mpv infile -o outfile.avi \
-    -ofps 25 \
+    --vf=fps=25 \
     -ovc mpeg4 -ovcopts qscale=4 \
     -oac libmp3lame -oacopts ab=128k
 
-Note: AVI does not support variable frame rate, so -ofps must be used. The
-frame rate should ideally match the input (25 for PAL, 24000/1001 or 30000/1001
-for NTSC)
+Note: AVI does not support variable frame rate, so the fps filter must be used.
+The frame rate should ideally match the input (25 for PAL, 24000/1001 or
+30000/1001 for NTSC)
 
 Typical MPEG-4 Part 10 ("AVC", "H.264") encoding, Matroska (MKV) container::
 
@@ -95,11 +94,15 @@ As the options for various devices can get complex, profiles can be used.
 
 An example profile file for encoding is provided in
 etc/encoding-profiles.conf in the source tree. This file is installed and loaded
-by default (if libavfilter is enabled at compilation). If you want to modify
-it, you can replace and it with your own copy by doing::
+by default. If you want to modify it, you can replace and it with your own copy
+by doing::
 
   mkdir -p ~/.mpv
   cp /etc/mpv/encoding-profiles.conf ~/.mpv/encoding-profiles.conf
+
+Keep in mind that the default profile is the playback one. If you want to add
+options that apply only in encoding mode, put them into a ``[encoding]``
+section.
 
 Refer to the top of that file for more comments - in a nutshell, the following
 options are added by it::
@@ -125,7 +128,7 @@ What works
 ==========
 
 * Encoding at variable frame rate (default)
-* Encoding at constant frame rate using -ofps framerate -oharddup
+* Encoding at constant frame rate using --vf=fps=RATE
 * 2-pass encoding (specify flags=+pass1 in the first pass's -ovcopts, specify
   flags=+pass2 in the second pass)
 * Hardcoding subtitles using vobsub, ass or srt subtitle rendering (just

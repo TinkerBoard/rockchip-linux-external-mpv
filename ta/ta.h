@@ -1,4 +1,6 @@
-/* Permission to use, copy, modify, and/or distribute this software for any
+/* Copyright (C) 2017 the mpv developers
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
  *
@@ -27,7 +29,7 @@
 #endif
 
 // Broken crap with __USE_MINGW_ANSI_STDIO
-#ifdef __MINGW32__
+#if defined(__MINGW32__) && defined(__GNUC__) && !defined(__clang__)
 #undef TA_PRF
 #define TA_PRF(a1, a2) __attribute__ ((format (gnu_printf, a1, a2)))
 #endif
@@ -94,6 +96,9 @@ bool ta_vasprintf_append_buffer(char **str, const char *fmt, va_list ap) TA_PRF(
 
 #define ta_steal(ta_parent, ptr) (TA_TYPEOF(ptr))ta_steal_(ta_parent, ptr)
 
+#define ta_dup(ta_parent, ptr) \
+    (TA_TYPEOF(ptr))ta_memdup(ta_parent, ptr, sizeof(*(ptr)))
+
 // Ugly macros that crash on OOM.
 // All of these mirror real functions (with a 'x' added after the 'ta_'
 // prefix), and the only difference is that they will call abort() on allocation
@@ -121,6 +126,7 @@ bool ta_vasprintf_append_buffer(char **str, const char *fmt, va_list ap) TA_PRF(
 #define ta_xnew_array_size(...)         ta_oom_p(ta_new_array_size(__VA_ARGS__))
 #define ta_xnew_ptrtype(...)            ta_oom_g(ta_new_ptrtype(__VA_ARGS__))
 #define ta_xnew_array_ptrtype(...)      ta_oom_g(ta_new_array_ptrtype(__VA_ARGS__))
+#define ta_xdup(...)                    ta_oom_g(ta_dup(__VA_ARGS__))
 
 #define ta_xsteal(ta_parent, ptr) (TA_TYPEOF(ptr))ta_xsteal_(ta_parent, ptr)
 #define ta_xrealloc(ta_parent, ptr, type, count) \

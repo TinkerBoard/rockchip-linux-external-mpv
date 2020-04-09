@@ -4,23 +4,19 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-// See  http://msdn.microsoft.com/library/default.asp?url=/library/en-us/winui/WinUI/WindowsUserInterface/UserInput/VirtualKeyCodes.asp
-// for additional virtual keycodes
-
 
 #include "config.h"
 #include <fcntl.h>
@@ -70,81 +66,82 @@ void terminal_get_size(int *w, int *h)
     }
 }
 
-static void read_input(void)
+static bool has_input_events(HANDLE h)
 {
-    DWORD retval;
-    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD num_events;
+    if (!GetNumberOfConsoleInputEvents(h, &num_events))
+        return false;
+    return !!num_events;
+}
 
-    /*check if there are input events*/
-    if (!GetNumberOfConsoleInputEvents(in, &retval))
-        return;
-    if (!retval)
-        return;
-
-    /*read all events*/
-    INPUT_RECORD eventbuffer[128];
-    if (!ReadConsoleInput(in, eventbuffer, MP_ARRAY_SIZE(eventbuffer), &retval))
-        return;
-
-    /*filter out keyevents*/
-    for (int i = 0; i < retval; i++) {
-        switch (eventbuffer[i].EventType) {
-        case KEY_EVENT: {
-            KEY_EVENT_RECORD *record = &eventbuffer[i].Event.KeyEvent;
-
-            /*only a pressed key is interresting for us*/
-            if (record->bKeyDown) {
-                UINT vkey = record->wVirtualKeyCode;
-                bool ext = record->dwControlKeyState & ENHANCED_KEY;
-
-                int mpkey = mp_w32_vkey_to_mpkey(vkey, ext);
-                if (mpkey) {
-                    mp_input_put_key(input_ctx, mpkey);
-                } else {
-                    /*only characters should be remaining*/
-                    int c = record->uChar.UnicodeChar;
-                    if (c > 0)
-                        mp_input_put_key(input_ctx, c);
-                }
-            }
+static void read_input(HANDLE in)
+{
+    // Process any input events in the buffer
+    while (has_input_events(in)) {
+        INPUT_RECORD event;
+        if (!ReadConsoleInputW(in, &event, 1, &(DWORD){0}))
             break;
-        }
-        case MOUSE_EVENT:
-        case WINDOW_BUFFER_SIZE_EVENT:
-        case FOCUS_EVENT:
-        case MENU_EVENT:
-        default:
-            break;
+
+        // Only key-down events are interesting to us
+        if (event.EventType != KEY_EVENT)
+            continue;
+        KEY_EVENT_RECORD *record = &event.Event.KeyEvent;
+        if (!record->bKeyDown)
+            continue;
+
+        UINT vkey = record->wVirtualKeyCode;
+        bool ext = record->dwControlKeyState & ENHANCED_KEY;
+
+        int mods = 0;
+        if (record->dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED))
+            mods |= MP_KEY_MODIFIER_ALT;
+        if (record->dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))
+            mods |= MP_KEY_MODIFIER_CTRL;
+        if (record->dwControlKeyState & SHIFT_PRESSED)
+            mods |= MP_KEY_MODIFIER_SHIFT;
+
+        int mpkey = mp_w32_vkey_to_mpkey(vkey, ext);
+        if (mpkey) {
+            mp_input_put_key(input_ctx, mpkey | mods);
+        } else {
+            // Only characters should be remaining
+            int c = record->uChar.UnicodeChar;
+            // The ctrl key always produces control characters in the console.
+            // Shift them back up to regular characters.
+            if (c > 0 && c < 0x20 && (mods & MP_KEY_MODIFIER_CTRL))
+                c += (mods & MP_KEY_MODIFIER_SHIFT) ? 0x40 : 0x60;
+            if (c >= 0x20)
+                mp_input_put_key(input_ctx, c | mods);
         }
     }
-    return;
 }
 
 static void *input_thread_fn(void *ptr)
 {
     mpthread_set_name("terminal");
-    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE in = ptr;
     HANDLE stuff[2] = {in, death};
     while (1) {
         DWORD r = WaitForMultipleObjects(2, stuff, FALSE, INFINITE);
         if (r != WAIT_OBJECT_0)
             break;
-        read_input();
+        read_input(in);
     }
     return NULL;
 }
 
 void terminal_setup_getch(struct input_ctx *ictx)
 {
-    assert(!running);
+    if (running)
+        return;
 
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     if (GetNumberOfConsoleInputEvents(in, &(DWORD){0})) {
         input_ctx = ictx;
-        death = CreateEvent(NULL, TRUE, FALSE, NULL);
+        death = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (!death)
             return;
-        if (pthread_create(&input_thread, NULL, input_thread_fn, NULL)) {
+        if (pthread_create(&input_thread, NULL, input_thread_fn, in)) {
             CloseHandle(death);
             return;
         }
@@ -254,12 +251,11 @@ static bool is_a_console(HANDLE h)
     return GetConsoleMode(h, &(DWORD){0});
 }
 
-static void reopen_console_handle(DWORD std, FILE *stream)
+static void reopen_console_handle(DWORD std, int fd, FILE *stream)
 {
-    HANDLE wstream = GetStdHandle(std);
-    if (is_a_console(wstream)) {
-        int fd = _open_osfhandle((intptr_t)wstream, _O_TEXT);
-        dup2(fd, fileno(stream));
+    if (is_a_console(GetStdHandle(std))) {
+        freopen("CONOUT$", "wt", stream);
+        dup2(fileno(stream), fd);
         setvbuf(stream, NULL, _IONBF, 0);
     }
 }
@@ -282,14 +278,14 @@ bool terminal_try_attach(void)
         return false;
 
     // We have a console window. Redirect output streams to that console's
-    // low-level handles, so we can actually use WriteConsole later on.
-    reopen_console_handle(STD_OUTPUT_HANDLE, stdout);
-    reopen_console_handle(STD_ERROR_HANDLE, stderr);
+    // low-level handles, so things that use printf directly work later on.
+    reopen_console_handle(STD_OUTPUT_HANDLE, STDOUT_FILENO, stdout);
+    reopen_console_handle(STD_ERROR_HANDLE, STDERR_FILENO, stderr);
 
     return true;
 }
 
-int terminal_init(void)
+void terminal_init(void)
 {
     CONSOLE_SCREEN_BUFFER_INFO cinfo;
     DWORD cmode = 0;
@@ -299,5 +295,4 @@ int terminal_init(void)
     SetConsoleMode(hSTDERR, cmode);
     GetConsoleScreenBufferInfo(hSTDOUT, &cinfo);
     stdoutAttrs = cinfo.wAttributes;
-    return 0;
 }

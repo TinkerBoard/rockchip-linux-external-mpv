@@ -1,12 +1,14 @@
 import os
-from inflectors import DependencyInflector
+import inflector
 from waflib.ConfigSet import ConfigSet
 from waflib import Utils
 
 __all__ = [
-    "check_pkg_config", "check_cc", "check_statement", "check_libs",
+    "check_pkg_config", "check_pkg_config_mixed", "check_pkg_config_mixed_all",
+    "check_pkg_config_cflags", "check_cc", "check_statement", "check_libs",
     "check_headers", "compose_checks", "check_true", "any_version",
-    "load_fragment", "check_stub", "check_ctx_vars", "check_program"]
+    "load_fragment", "check_stub", "check_ctx_vars", "check_program",
+    "check_pkg_config_datadir"]
 
 any_version = None
 
@@ -14,10 +16,10 @@ def even(n):
     return n % 2 == 0
 
 def __define_options__(dependency_identifier):
-    return DependencyInflector(dependency_identifier).define_dict()
+    return inflector.define_dict(dependency_identifier)
 
 def __merge_options__(dependency_identifier, *args):
-    options_accu = DependencyInflector(dependency_identifier).storage_dict()
+    options_accu = inflector.storage_dict(dependency_identifier)
     options_accu['mandatory'] = False
     [options_accu.update(arg) for arg in args if arg]
     return options_accu
@@ -69,18 +71,37 @@ def check_cc(**kw_ext):
     return fn
 
 def check_pkg_config(*args, **kw_ext):
+    return _check_pkg_config([], ["--libs", "--cflags"], *args, **kw_ext)
+
+def check_pkg_config_mixed(_dyn_libs, *args, **kw_ext):
+    return _check_pkg_config([_dyn_libs], ["--libs", "--cflags"], *args, **kw_ext)
+
+def check_pkg_config_mixed_all(*all_args, **kw_ext):
+    args = [all_args[i] for i in [n for n in range(0, len(all_args)) if n % 3]]
+    return _check_pkg_config(all_args[::3], ["--libs", "--cflags"], *args, **kw_ext)
+
+def check_pkg_config_cflags(*args, **kw_ext):
+    return _check_pkg_config([], ["--cflags"], *args, **kw_ext)
+
+def check_pkg_config_datadir(*args, **kw_ext):
+    return _check_pkg_config([], ["--variable=pkgdatadir"], *args, **kw_ext)
+
+def _check_pkg_config(_dyn_libs, _pkgc_args, *args, **kw_ext):
     def fn(ctx, dependency_identifier, **kw):
         argsl     = list(args)
         packages  = args[::2]
         verchecks = args[1::2]
         sargs     = []
+        pkgc_args = _pkgc_args
+        dyn_libs  = {}
         for i in range(0, len(packages)):
             if i < len(verchecks):
                 sargs.append(packages[i] + ' ' + verchecks[i])
             else:
                 sargs.append(packages[i])
-        pkgc_args = ["--libs", "--cflags"]
-        if ctx.dependency_satisfied('static-build'):
+            if _dyn_libs and _dyn_libs[i]:
+                dyn_libs[packages[i]] = _dyn_libs[i]
+        if ctx.dependency_satisfied('static-build') and not dyn_libs:
             pkgc_args += ["--static"]
 
         defaults = {
@@ -96,12 +117,14 @@ def check_pkg_config(*args, **kw_ext):
         # added only at its first occurrence.
         original_append_unique  = ConfigSet.append_unique
         ConfigSet.append_unique = ConfigSet.append_value
-        result = bool(ctx.check_cfg(**opts))
+        result = ctx.check_cfg(**opts)
         ConfigSet.append_unique = original_append_unique
 
-        defkey = DependencyInflector(dependency_identifier).define_key()
+        defkey = inflector.define_key(dependency_identifier)
         if result:
             ctx.define(defkey, 1)
+            for x in dyn_libs.keys():
+                ctx.env['LIB_'+x] += dyn_libs[x]
         else:
             ctx.add_optional_message(dependency_identifier,
                                      "'{0}' not found".format(" ".join(sargs)))
@@ -113,8 +136,7 @@ def check_headers(*headers, **kw_ext):
     def undef_others(ctx, headers, found):
         not_found_hs = set(headers) - set([found])
         for not_found_h in not_found_hs:
-            defkey = DependencyInflector(not_found_h).define_key()
-            ctx.undefine(defkey)
+            ctx.undefine(inflector.define_key(not_found_h))
 
     def fn(ctx, dependency_identifier):
         for header in headers:
@@ -122,16 +144,14 @@ def check_headers(*headers, **kw_ext):
             options  = __merge_options__(dependency_identifier, defaults, kw_ext)
             if ctx.check(**options):
                 undef_others(ctx, headers, header)
-                defkey = DependencyInflector(dependency_identifier).define_key()
-                ctx.define(defkey, 1)
+                ctx.define(inflector.define_key(dependency_identifier), 1)
                 return True
         undef_others(ctx, headers, None)
         return False
     return fn
 
 def check_true(ctx, dependency_identifier):
-    defkey = DependencyInflector(dependency_identifier).define_key()
-    ctx.define(defkey, 1)
+    ctx.define(inflector.define_key(dependency_identifier), 1)
     return True
 
 def check_ctx_vars(*variables):
@@ -151,8 +171,7 @@ def check_ctx_vars(*variables):
     return fn
 
 def check_stub(ctx, dependency_identifier):
-    defkey = DependencyInflector(dependency_identifier).define_key()
-    ctx.undefine(defkey)
+    ctx.undefine(inflector.define_key(dependency_identifier))
     return False
 
 def compose_checks(*checks):

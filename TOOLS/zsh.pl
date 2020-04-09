@@ -2,18 +2,38 @@
 
 # Generate ZSH completion
 
+#
+# This file is part of mpv.
+#
+# mpv is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# mpv is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+#
+
 use strict;
 use warnings;
+use warnings FATAL => 'uninitialized';
 
 my $mpv = $ARGV[0] || 'mpv';
 
 my @opts = parse_main_opts('--list-options', '^ (\-\-[^\s\*]*)\*?\s*(.*)');
 
-my @ao = parse_opts('--ao=help', '^  ([^\s\:]*)\s*: (.*)');
-my @vo = parse_opts('--vo=help', '^  ([^\s\:]*)\s*: (.*)');
+die "Couldn't find any options" unless (@opts);
 
-my @af = parse_opts('--af=help', '^  ([^\s\:]*)\s*: (.*)');
-my @vf = parse_opts('--vf=help', '^  ([^\s\:]*)\s*: (.*)');
+my @ao = parse_opts('--ao=help', '^  ([^\s\:]*)\s*(.*)');
+my @vo = parse_opts('--vo=help', '^  ([^\s\:]*)\s*(.*)');
+
+my @af = parse_opts('--af=help', '^  ([^\s\:]*)\s*(.*)');
+my @vf = parse_opts('--vf=help', '^  ([^\s\:]*)\s*(.*)');
 
 my @protos = parse_opts('--list-protocols', '^ ([^\s]*)');
 
@@ -36,7 +56,8 @@ chomp $vf_str;
 
 $protos_str = join(' ', @protos);
 
-my $profile_comp = <<'EOS';
+my $runtime_completions = <<'EOS';
+  profile|show-profile)
     local -a profiles
     local current
     for current in "${(@f)$($words[1] --profile=help)}"; do
@@ -63,16 +84,42 @@ my $profile_comp = <<'EOS';
       profiles=($profiles 'help[list profiles]')
       _values -s , 'profile(s)' $profiles && rc=0
     fi
+  ;;
+
+  audio-device)
+    local -a audio_devices
+    local current
+    for current in "${(@f)$($words[1] --audio-device=help)}"; do
+      current=${current//\*/\\\*}
+      current=${current//\:/\\\:}
+      current=${current//\[/\\\[}
+      current=${current//\]/\\\]}
+      if [[ $current =~ '  '\'([^\']*)\'' \('(.*)'\)' ]]; then
+        audio_devices=($audio_devices "$match[1][$match[2]]")
+      fi
+    done
+    audio_devices=($audio_devices 'help[list audio devices]')
+    _values 'audio device' $audio_devices && rc=0
+  ;;
 EOS
-chomp $profile_comp;
+chomp $runtime_completions;
 
 my $tmpl = <<"EOS";
 #compdef mpv
 
-# mpv zsh completion
+# For customization, see:
+#  https://github.com/mpv-player/mpv/wiki/Zsh-completion-customization
 
 local curcontext="\$curcontext" state state_descr line
 typeset -A opt_args
+
+local -a match mbegin mend
+local MATCH MBEGIN MEND
+
+# By default, don't complete URLs unless no files match
+local -a tag_order
+zstyle -a ":completion:*:*:\$service:*" tag-order tag_order || \
+  zstyle  ":completion:*:*:\$service:*" tag-order '!urls'
 
 local rc=1
 
@@ -105,9 +152,7 @@ $vf_str
     && rc=0
   ;;
 
-  profile|show-profile)
-$profile_comp
-  ;;
+$runtime_completions
 
   files)
     compset -P '*,'
@@ -119,8 +164,7 @@ $profile_comp
     local expl
     _tags files urls
     while _tags; do
-      _requested files expl 'media file' _files -g \\
-        "*.(#i)(asf|asx|avi|flac|flv|m1v|m2p|m2v|m4v|mjpg|mka|mkv|mov|mp3|mp4|mpe|mpeg|mpg|ogg|ogm|ogv|qt|rm|ts|vob|wav|webm|wma|wmv)(-.)" && rc=0
+      _requested files expl 'media file' _files && rc=0
       if _requested urls; then
         while _next_label urls expl URL; do
           _urls "\$expl[@]" && rc=0
@@ -141,7 +185,7 @@ sub parse_main_opts {
     my ($cmd, $regex) = @_;
 
     my @list;
-    my @lines = split /\n/, `"$mpv" --no-config $cmd`;
+    my @lines = call_mpv($cmd);
 
     foreach my $line (@lines) {
         my ($name, $desc) = ($line =~ /^$regex/) or next;
@@ -183,7 +227,7 @@ sub parse_main_opts {
                 }
             } elsif ($line =~ /\[file\]/) {
                 $entry .= '->files';
-            } elsif ($name =~ /^--(ao|vo|af|vf|profile|show-profile)$/) {
+            } elsif ($name =~ /^--(ao|vo|af|vf|profile|show-profile|audio-device)$/) {
                 $entry .= "->$1";
             }
             push @list, $entry;
@@ -206,7 +250,7 @@ sub parse_opts {
     my ($cmd, $regex) = @_;
 
     my @list;
-    my @lines = split /\n/, `"$mpv" --no-config $cmd`;
+    my @lines = call_mpv($cmd);
 
     foreach my $line (@lines) {
         if ($line !~ /^$regex/) {
@@ -225,4 +269,15 @@ sub parse_opts {
     }
 
     return @list;
+}
+
+sub call_mpv {
+    my ($cmd) = @_;
+    my $output = `"$mpv" --no-config $cmd`;
+    if ($? == -1) {
+        die "Could not run mpv: $!";
+    } elsif ((my $exit_code = $? >> 8) != 0) {
+        die "mpv returned $exit_code with output:\n$output";
+    }
+    return split /\n/, $output;
 }

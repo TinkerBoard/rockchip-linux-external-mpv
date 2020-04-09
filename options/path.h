@@ -3,18 +3,18 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_PATH_H
@@ -30,6 +30,12 @@ struct mpv_global;
 // related lookups (i.e.: OSX inside an application bundle).
 char *mp_find_config_file(void *talloc_ctx, struct mpv_global *global,
                           const char *filename);
+
+// Like mp_find_config_file(), but search only the local writable user config
+// dir. Also, this returns a result even if the file does not exist. Calling
+// it with filename="" is equivalent to retrieving the user config dir.
+char *mp_find_user_config_file(void *talloc_ctx, struct mpv_global *global,
+                               const char *filename);
 
 // Find all instances of the given config file. Paths are returned in order
 // from lowest to highest priority. filename can contain multiple names
@@ -59,11 +65,14 @@ char *mp_splitext(const char *path, bstr *root);
  */
 struct bstr mp_dirname(const char *path);
 
+void mp_path_strip_trailing_separator(char *path);
+
 /* Join two path components and return a newly allocated string
  * for the result. '/' is inserted between the components if needed.
  * If p2 is an absolute path then the value of p1 is ignored.
  */
-char *mp_path_join(void *talloc_ctx, struct bstr p1, struct bstr p2);
+char *mp_path_join(void *talloc_ctx, const char *p1, const char *p2);
+char *mp_path_join_bstr(void *talloc_ctx, struct bstr p1, struct bstr p2);
 
 char *mp_getcwd(void *talloc_ctx);
 

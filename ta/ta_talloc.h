@@ -1,4 +1,6 @@
-/* Permission to use, copy, modify, and/or distribute this software for any
+/* Copyright (C) 2017 the mpv developers
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
  *
@@ -13,6 +15,8 @@
 
 #ifndef TA_TALLOC_H_
 #define TA_TALLOC_H_
+
+#include <string.h>
 
 #include "ta.h"
 
@@ -41,6 +45,7 @@
 #define talloc_get_size                 ta_get_size
 #define talloc_free_children            ta_free_children
 #define talloc_free                     ta_free
+#define talloc_dup                      ta_xdup
 #define talloc_memdup                   ta_xmemdup
 #define talloc_strdup                   ta_xstrdup
 #define talloc_strndup                  ta_xstrndup
@@ -73,6 +78,8 @@ char *ta_talloc_asprintf_append_buffer(char *s, const char *fmt, ...) TA_PRF(2, 
 
 // mpv specific stuff - should be made part of proper TA API
 
+#define TA_FREEP(pctx) do {talloc_free(*(pctx)); *(pctx) = NULL;} while(0)
+
 #define TA_EXPAND_ARGS(...) __VA_ARGS__
 
 #define MP_TALLOC_AVAIL(p) (talloc_get_size(p) / sizeof((p)[0]))
@@ -90,13 +97,22 @@ char *ta_talloc_asprintf_append_buffer(char *s, const char *fmt, ...) TA_PRF(2, 
             MP_RESIZE_ARRAY(ctx, p, ta_calc_prealloc_elems(nextidx_)); \
     } while (0)
 
-#define MP_GROW_ARRAY(p, nextidx) MP_TARRAY_GROW(NULL, p, nextidx)
-
 #define MP_TARRAY_APPEND(ctx, p, idxvar, ...)       \
     do {                                            \
         MP_TARRAY_GROW(ctx, p, idxvar);             \
         (p)[(idxvar)] = (TA_EXPAND_ARGS(__VA_ARGS__));\
         (idxvar)++;                                 \
+    } while (0)
+
+#define MP_TARRAY_INSERT_AT(ctx, p, idxvar, at, ...)\
+    do {                                            \
+        size_t at_ = (at);                          \
+        assert(at_ <= (idxvar));                    \
+        MP_TARRAY_GROW(ctx, p, idxvar);             \
+        memmove((p) + at_ + 1, (p) + at_,           \
+                ((idxvar) - at_) * sizeof((p)[0])); \
+        (idxvar)++;                                 \
+        (p)[at_] = (TA_EXPAND_ARGS(__VA_ARGS__));   \
     } while (0)
 
 // Doesn't actually free any memory, or do any other talloc calls.
@@ -108,6 +124,13 @@ char *ta_talloc_asprintf_append_buffer(char *s, const char *fmt, ...) TA_PRF(2, 
                 ((idxvar) - at_ - 1) * sizeof((p)[0])); \
         (idxvar)--;                                 \
     } while (0)
+
+// Returns whether or not there was any element to pop.
+#define MP_TARRAY_POP(p, idxvar, out)               \
+    ((idxvar) > 0                                   \
+        ? (*(out) = (p)[--(idxvar)], true)          \
+        : false                                     \
+    )
 
 #define talloc_struct(ctx, type, ...) \
     talloc_memdup(ctx, &(type) TA_EXPAND_ARGS(__VA_ARGS__), sizeof(type))

@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stddef.h>
@@ -35,9 +35,8 @@
 
 #include "osdep/threads.h"
 #include "osdep/timer.h"
-#include "osdep/atomics.h"
+#include "osdep/atomic.h"
 
-#include "audio/audio.h"
 #include "audio/audio_buffer.h"
 
 struct ao_push_state {
@@ -49,11 +48,15 @@ struct ao_push_state {
 
     struct mp_audio_buffer *buffer;
 
+    uint8_t *silence[MP_NUM_CHANNELS];
+    int silence_samples;
+
     bool terminate;
     bool wait_on_ao;
     bool still_playing;
     bool need_wakeup;
     bool paused;
+    bool initial_unblocked;
 
     // Whether the current buffer contains the complete audio.
     bool final_chunk;
@@ -142,6 +145,7 @@ static void resume(struct ao *ao)
 static void drain(struct ao *ao)
 {
     struct ao_push_state *p = ao->api_priv;
+    double maxbuffer = ao->buffer / (double)ao->samplerate + 1;
 
     MP_VERBOSE(ao, "draining...\n");
 
@@ -151,14 +155,23 @@ static void drain(struct ao *ao)
 
     p->final_chunk = true;
     wakeup_playthread(ao);
-    while (p->still_playing && mp_audio_buffer_samples(p->buffer) > 0)
-        pthread_cond_wait(&p->wakeup, &p->lock);
+
+    // Wait until everything is done. Since the audio API (especially ALSA)
+    // can't be trusted to do this right, and we're hard-blocking here, apply
+    // an upper bound timeout.
+    struct timespec until = mp_rel_time_to_timespec(maxbuffer);
+    while (p->still_playing && mp_audio_buffer_samples(p->buffer) > 0) {
+        if (pthread_cond_timedwait(&p->wakeup, &p->lock, &until)) {
+            MP_WARN(ao, "Draining is taking too long, aborting.\n");
+            goto done;
+        }
+    }
 
     if (ao->driver->drain) {
         ao->driver->drain(ao);
     } else {
         double time = unlocked_get_delay(ao);
-        mp_sleep_us(MPMIN(time, ao->buffer / (double)ao->samplerate + 1) * 1e6);
+        mp_sleep_us(MPMIN(time, maxbuffer) * 1e6);
     }
 
 done:
@@ -172,6 +185,7 @@ static int unlocked_get_space(struct ao *ao)
     struct ao_push_state *p = ao->api_priv;
     int space = mp_audio_buffer_get_write_available(p->buffer);
     if (ao->driver->get_space) {
+        int align = af_format_sample_alignment(ao->format);
         // The following code attempts to keep the total buffered audio to
         // ao->buffer in order to improve latency.
         int device_space = ao->driver->get_space(ao);
@@ -181,6 +195,7 @@ static int unlocked_get_space(struct ao *ao)
         // byte based and doesn't do proper chunked processing.
         int min_buffer = ao->buffer + 64;
         int missing = min_buffer - device_buffered - soft_buffered;
+        missing = (missing + align - 1) / align * align;
         // But always keep the device's buffer filled as much as we can.
         int device_missing = device_space - soft_buffered;
         missing = MPMAX(missing, device_missing);
@@ -223,12 +238,7 @@ static int play(struct ao *ao, void **data, int samples, int flags)
         flags = flags & ~AOPLAY_FINAL_CHUNK;
     bool is_final = flags & AOPLAY_FINAL_CHUNK;
 
-    struct mp_audio audio;
-    mp_audio_buffer_get_format(p->buffer, &audio);
-    for (int n = 0; n < ao->num_planes; n++)
-        audio.planes[n] = data[n];
-    audio.samples = write_samples;
-    mp_audio_buffer_append(p->buffer, &audio);
+    mp_audio_buffer_append(p->buffer, data, samples);
 
     bool got_data = write_samples > 0 || p->paused || p->final_chunk != is_final;
 
@@ -237,47 +247,88 @@ static int play(struct ao *ao, void **data, int samples, int flags)
     if (got_data) {
         p->still_playing = true;
         p->expected_end_time = 0;
-    }
 
-    // If we don't have new data, the decoder thread basically promises it
-    // will send new data as soon as it's available.
-    if (got_data)
+        // If we don't have new data, the decoder thread basically promises it
+        // will send new data as soon as it's available.
         wakeup_playthread(ao);
+    }
     pthread_mutex_unlock(&p->lock);
     return write_samples;
+}
+
+static bool realloc_silence(struct ao *ao, int samples)
+{
+    struct ao_push_state *p = ao->api_priv;
+
+    if (samples <= 0 || !af_fmt_is_pcm(ao->format))
+        return false;
+
+    if (samples > p->silence_samples) {
+        talloc_free(p->silence[0]);
+
+        int bytes = af_fmt_to_bytes(ao->format) * samples * ao->channels.num;
+        p->silence[0] = talloc_size(p, bytes);
+        for (int n = 1; n < MP_NUM_CHANNELS; n++)
+            p->silence[n] = p->silence[0];
+        p->silence_samples = samples;
+
+        af_fill_silence(p->silence[0], bytes, ao->format);
+    }
+
+    return true;
 }
 
 // called locked
 static void ao_play_data(struct ao *ao)
 {
     struct ao_push_state *p = ao->api_priv;
-    struct mp_audio data;
-    mp_audio_buffer_peek(p->buffer, &data);
-    int max = data.samples;
     int space = ao->driver->get_space(ao);
+    bool play_silence = p->paused || (ao->stream_silence && !p->still_playing);
     space = MPMAX(space, 0);
-    if (data.samples > space)
-        data.samples = space;
+    if (space % ao->period_size)
+        MP_ERR(ao, "Audio device reports unaligned available buffer size.\n");
+    uint8_t **planes;
+    int samples;
+    if (play_silence) {
+        planes = p->silence;
+        samples = realloc_silence(ao, space) ? space : 0;
+    } else {
+        mp_audio_buffer_peek(p->buffer, &planes, &samples);
+    }
+    int max = samples;
+    if (samples > space)
+        samples = space;
     int flags = 0;
-    if (p->final_chunk && data.samples == max)
+    if (p->final_chunk && samples == max) {
         flags |= AOPLAY_FINAL_CHUNK;
+    } else {
+        samples = samples / ao->period_size * ao->period_size;
+    }
     MP_STATS(ao, "start ao fill");
+    ao_post_process_data(ao, (void **)planes, samples);
     int r = 0;
-    if (data.samples)
-        r = ao->driver->play(ao, data.planes, data.samples, flags);
+    if (samples)
+        r = ao->driver->play(ao, (void **)planes, samples, flags);
     MP_STATS(ao, "end ao fill");
-    if (r > data.samples) {
-        MP_WARN(ao, "Audio device returned non-sense value.\n");
-        r = data.samples;
+    if (r > samples) {
+        MP_ERR(ao, "Audio device returned nonsense value.\n");
+        r = samples;
+    } else if (r < 0) {
+        MP_ERR(ao, "Error writing audio to device.\n");
+    } else if (r != samples) {
+        MP_ERR(ao, "Audio device returned broken buffer state (sent %d samples, "
+               "got %d samples, %d period%s)!\n", samples, r,
+               ao->period_size, flags & AOPLAY_FINAL_CHUNK ? " final" : "");
     }
     r = MPMAX(r, 0);
     // Probably can't copy the rest of the buffer due to period alignment.
-    bool stuck_eof = r <= 0 && space >= max && data.samples > 0;
+    bool stuck_eof = r <= 0 && space >= max && samples > 0;
     if ((flags & AOPLAY_FINAL_CHUNK) && stuck_eof) {
         MP_ERR(ao, "Audio output driver seems to ignore AOPLAY_FINAL_CHUNK.\n");
         r = max;
     }
-    mp_audio_buffer_skip(p->buffer, r);
+    if (!play_silence)
+        mp_audio_buffer_skip(p->buffer, r);
     if (r > 0)
         p->expected_end_time = 0;
     // Nothing written, but more input data than space - this must mean the
@@ -288,15 +339,16 @@ static void ao_play_data(struct ao *ao)
     // Wait until space becomes available. Also wait if we actually wrote data,
     // so the AO wakes us up properly if it needs more data.
     p->wait_on_ao = space == 0 || r > 0 || stuck;
-    p->still_playing |= r > 0;
+    p->still_playing |= r > 0 && !play_silence;
     // If we just filled the AO completely (r == space), don't refill for a
     // while. Prevents wakeup feedback with byte-granular AOs.
     int needed = unlocked_get_space(ao);
-    bool more = needed >= (r == space ? ao->device_buffer / 4 : 1) && !stuck;
+    bool more = needed >= (r == space ? ao->device_buffer / 4 : 1) && !stuck &&
+                !(flags & AOPLAY_FINAL_CHUNK);
     if (more)
-        mp_input_wakeup(ao->input_ctx); // request more data
-    MP_TRACE(ao, "in=%d flags=%d space=%d r=%d wa=%d needed=%d more=%d\n",
-             max, flags, space, r, p->wait_on_ao, needed, more);
+        ao->wakeup_cb(ao->wakeup_ctx); // request more data
+    MP_TRACE(ao, "in=%d flags=%d space=%d r=%d wa/pl=%d/%d needed=%d more=%d\n",
+             max, flags, space, r, p->wait_on_ao, p->still_playing, needed, more);
 }
 
 static void *playthread(void *arg)
@@ -306,12 +358,14 @@ static void *playthread(void *arg)
     mpthread_set_name("ao");
     pthread_mutex_lock(&p->lock);
     while (!p->terminate) {
-        if (!p->paused)
+        bool blocked = ao->driver->initially_blocked && !p->initial_unblocked;
+        bool playing = (!p->paused || ao->stream_silence) && !blocked;
+        if (playing)
             ao_play_data(ao);
 
         if (!p->need_wakeup) {
             MP_STATS(ao, "start audio wait");
-            if (!p->wait_on_ao || p->paused) {
+            if (!p->wait_on_ao || !playing) {
                 // Avoid busy waiting, because the audio API will still report
                 // that it needs new data, even if we're not ready yet, or if
                 // get_space() decides that the amount of audio buffered in the
@@ -336,7 +390,7 @@ static void *playthread(void *arg)
                 }
 
                 if (was_playing && !p->still_playing)
-                    mp_input_wakeup(ao->input_ctx);
+                    ao->wakeup_cb(ao->wakeup_ctx);
                 pthread_cond_signal(&p->wakeup); // for draining
 
                 if (p->still_playing && timeout > 0) {
@@ -373,8 +427,11 @@ static void destroy_no_thread(struct ao *ao)
 
     ao->driver->uninit(ao);
 
-    for (int n = 0; n < 2; n++)
-        close(p->wakeup_pipe[n]);
+    for (int n = 0; n < 2; n++) {
+        int h = p->wakeup_pipe[n];
+        if (h >= 0)
+            close(h);
+    }
 
     pthread_cond_destroy(&p->wakeup);
     pthread_mutex_destroy(&p->lock);
@@ -438,16 +495,26 @@ const struct ao_driver ao_api_push = {
 int ao_play_silence(struct ao *ao, int samples)
 {
     assert(ao->api == &ao_api_push);
-    if (samples <= 0 || AF_FORMAT_IS_SPECIAL(ao->format) || !ao->driver->play)
+
+    struct ao_push_state *p = ao->api_priv;
+
+    if (!realloc_silence(ao, samples) || !ao->driver->play)
         return 0;
-    char *p = talloc_size(NULL, samples * ao->sstride);
-    af_fill_silence(p, samples * ao->sstride, ao->format);
-    void *tmp[MP_NUM_CHANNELS];
-    for (int n = 0; n < MP_NUM_CHANNELS; n++)
-        tmp[n] = p;
-    int r = ao->driver->play(ao, tmp, samples, 0);
-    talloc_free(p);
-    return r;
+
+    return ao->driver->play(ao, (void **)p->silence, samples, 0);
+}
+
+void ao_unblock(struct ao *ao)
+{
+    if (ao->api == &ao_api_push) {
+        struct ao_push_state *p = ao->api_priv;
+        pthread_mutex_lock(&p->lock);
+        p->need_wakeup = true;
+        p->initial_unblocked = true;
+        wakeup_playthread(ao);
+        pthread_cond_signal(&p->wakeup);
+        pthread_mutex_unlock(&p->lock);
+    }
 }
 
 #ifndef __MINGW32__
@@ -486,10 +553,8 @@ int ao_wait_poll(struct ao *ao, struct pollfd *fds, int num_fds,
     bool wakeup = false;
     if (p_fds[num_fds].revents & POLLIN) {
         wakeup = true;
-        // flush the wakeup pipe contents - might "drown" some wakeups, but
-        // that's ok for our use-case
-        char buf[100];
-        read(p->wakeup_pipe[0], buf, sizeof(buf));
+        // might "drown" some wakeups, but that's ok for our use-case
+        mp_flush_wakeup_pipe(p->wakeup_pipe[0]);
     }
     return (r >= 0 || r == -EINTR) ? wakeup : -1;
 }
@@ -499,7 +564,7 @@ void ao_wakeup_poll(struct ao *ao)
     assert(ao->api == &ao_api_push);
     struct ao_push_state *p = ao->api_priv;
 
-    write(p->wakeup_pipe[1], &(char){0}, 1);
+    (void)write(p->wakeup_pipe[1], &(char){0}, 1);
 }
 
 #endif

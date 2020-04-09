@@ -1,19 +1,20 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
+
 #include <stdio.h>
 #include <stdint.h>
 
@@ -66,8 +67,7 @@ static int fill_buffer(stream_t *s, char *buffer, int max_len)
     }
     // Size of file changes -> invalidate last block
     if (s->pos >= p->size - BLOCK_SIZE) {
-        int64_t new_size = -1;
-        stream_control(s, STREAM_CTRL_GET_SIZE, &new_size);
+        int64_t new_size = stream_get_size(s);
         if (p->size >= 0 && new_size != p->size)
             set_bit(p, BLOCK_ALIGN(p->size), 0);
         p->size = MPMIN(p->max_size, new_size);

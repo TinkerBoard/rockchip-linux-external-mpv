@@ -1,10 +1,10 @@
-from waftools.inflectors import DependencyInflector
+from waftools import inflector
 from waftools.checks.generic import *
 from waflib import Utils
 import os
 
-__all__ = ["check_pthreads", "check_iconv", "check_lua", "check_oss_4front",
-           "check_cocoa"]
+__all__ = ["check_pthreads", "check_iconv", "check_lua",
+           "check_cocoa", "check_wl_protocols", "check_swift"]
 
 pthreads_program = load_fragment('pthreads.c')
 
@@ -46,12 +46,19 @@ def check_iconv(ctx, dependency_identifier):
     iconv_program = load_fragment('iconv.c')
     libdliconv = " ".join(ctx.env.LIB_LIBDL + ['iconv'])
     libs       = ['iconv', libdliconv]
-    checkfn = check_cc(fragment=iconv_program)
+    args       = {'fragment': iconv_program}
+    if ctx.env.DEST_OS == 'openbsd' or ctx.env.DEST_OS == 'freebsd':
+        args['cflags'] = '-I/usr/local/include'
+        args['linkflags'] = '-L/usr/local/lib'
+    elif ctx.env.DEST_OS == 'win32':
+        args['linkflags'] = " ".join(['-L' + x for x in ctx.env.LIBRARY_PATH])
+    checkfn = check_cc(**args)
     return check_libs(libs, checkfn)(ctx, dependency_identifier)
 
 def check_lua(ctx, dependency_identifier):
     lua_versions = [
         ( '51',     'lua >= 5.1.0 lua < 5.2.0'),
+        ( '51obsd', 'lua51 >= 5.1.0'), # OpenBSD
         ( '51deb',  'lua5.1 >= 5.1.0'), # debian
         ( '51fbsd', 'lua-5.1 >= 5.1.0'), # FreeBSD
         ( '52',     'lua >= 5.2.0 lua < 5.3.0' ),
@@ -76,31 +83,13 @@ def check_lua(ctx, dependency_identifier):
             return True
     return False
 
-def __get_osslibdir():
-    cmd = ['sh', '-c', '. /etc/oss.conf && echo $OSSLIBDIR']
-    p = Utils.subprocess.Popen(cmd, stdin=Utils.subprocess.PIPE,
-                                    stdout=Utils.subprocess.PIPE,
-                                    stderr=Utils.subprocess.PIPE)
-    return p.communicate()[0].decode().rstrip()
-
-def check_oss_4front(ctx, dependency_identifier):
-    oss_libdir = __get_osslibdir()
-
-    # avoid false positive from native sys/soundcard.h
-    if not oss_libdir:
-        defkey = DependencyInflector(dependency_identifier).define_key()
-        ctx.undefine(defkey)
-        return False
-
-    soundcard_h = os.path.join(oss_libdir, "include/sys/soundcard.h")
-    include_dir = os.path.join(oss_libdir, "include")
-
-    fn = check_cc(header_name=soundcard_h,
-                  defines=['PATH_DEV_DSP="/dev/dsp"',
-                           'PATH_DEV_MIXER="/dev/mixer"'],
-                  cflags='-I{0}'.format(include_dir),
-                  fragment=load_fragment('oss_audio.c'))
-
+def check_wl_protocols(ctx, dependency_identifier):
+    def fn(ctx, dependency_identifier):
+        ret = check_pkg_config_datadir("wayland-protocols", ">= 1.14")
+        ret = ret(ctx, dependency_identifier)
+        if ret != None:
+            ctx.env.WL_PROTO_DIR = ret.split()[0]
+        return ret
     return fn(ctx, dependency_identifier)
 
 def check_cocoa(ctx, dependency_identifier):
@@ -111,4 +100,23 @@ def check_cocoa(ctx, dependency_identifier):
         includes         = ctx.srcnode.abspath(),
         linkflags        = '-fobjc-arc')
 
-    return fn(ctx, dependency_identifier)
+    res = fn(ctx, dependency_identifier)
+    if res and ctx.env.MACOS_SDK:
+        # on macOS we explicitly need to set the SDK path, otherwise it can lead
+        # to linking warnings or errors
+        ctx.env.append_value('LAST_LINKFLAGS', [
+            '-isysroot', ctx.env.MACOS_SDK,
+            '-L/usr/lib',
+            '-L/usr/local/lib'
+        ])
+
+    return res
+
+def check_swift(ctx, dependency_identifier):
+    if ctx.env.SWIFT_VERSION:
+        major = int(ctx.env.SWIFT_VERSION.split('.')[0])
+        ctx.add_optional_message(dependency_identifier,
+                                 'version found: ' + ctx.env.SWIFT_VERSION)
+        if major >= 3:
+            return True
+    return False

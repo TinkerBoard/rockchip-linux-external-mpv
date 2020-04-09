@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <assert.h>
@@ -27,13 +27,13 @@
 #include "sws_utils.h"
 
 #include "common/common.h"
+#include "options/m_config.h"
 #include "options/m_option.h"
 #include "video/mp_image.h"
 #include "video/img_format.h"
 #include "fmt-conversion.h"
 #include "csputils.h"
 #include "common/msg.h"
-#include "video/filter/vf.h"
 #include "osdep/endian.h"
 
 //global sws_flags from the command line
@@ -85,8 +85,10 @@ const int mp_sws_hq_flags = SWS_LANCZOS | SWS_FULL_CHR_H_INT |
 const int mp_sws_fast_flags = SWS_BILINEAR;
 
 // Set ctx parameters to global command line flags.
-void mp_sws_set_from_cmdline(struct mp_sws_context *ctx, struct sws_opts *opts)
+void mp_sws_set_from_cmdline(struct mp_sws_context *ctx, struct mpv_global *g)
 {
+    struct sws_opts *opts = mp_get_config_group(NULL, g, &sws_conf);
+
     sws_freeFilter(ctx->src_filter);
     ctx->src_filter = sws_getDefaultFilter(opts->lum_gblur, opts->chr_gblur,
                                            opts->lum_sharpen, opts->chr_sharpen,
@@ -95,6 +97,8 @@ void mp_sws_set_from_cmdline(struct mp_sws_context *ctx, struct sws_opts *opts)
 
     ctx->flags = SWS_PRINT_INFO;
     ctx->flags |= opts->scaler;
+
+    talloc_free(opts);
 }
 
 bool mp_sws_supported_format(int imgfmt)
@@ -159,9 +163,8 @@ int mp_sws_reinit(struct mp_sws_context *ctx)
     struct mp_image_params *dst = &ctx->dst;
 
     // Neutralize unsupported or ignored parameters.
-    src->d_w = dst->d_w = 0;
-    src->d_h = dst->d_h = 0;
-    src->outputlevels = dst->outputlevels = MP_CSP_LEVELS_AUTO;
+    src->p_w = dst->p_w = 0;
+    src->p_h = dst->p_h = 0;
 
     if (cache_valid(ctx))
         return 0;
@@ -193,11 +196,11 @@ int mp_sws_reinit(struct mp_sws_context *ctx)
         return -1;
     }
 
-    int s_csp = mp_csp_to_sws_colorspace(src->colorspace);
-    int s_range = src->colorlevels == MP_CSP_LEVELS_PC;
+    int s_csp = mp_csp_to_sws_colorspace(src->color.space);
+    int s_range = src->color.levels == MP_CSP_LEVELS_PC;
 
-    int d_csp = mp_csp_to_sws_colorspace(dst->colorspace);
-    int d_range = dst->colorlevels == MP_CSP_LEVELS_PC;
+    int d_csp = mp_csp_to_sws_colorspace(dst->color.space);
+    int d_range = dst->color.levels == MP_CSP_LEVELS_PC;
 
     // Work around libswscale bug #1852 (fixed in ffmpeg commit 8edf9b1fa):
     // setting range flags for RGB gives random bogus results.
@@ -218,7 +221,7 @@ int mp_sws_reinit(struct mp_sws_context *ctx)
     av_opt_set_double(ctx->sws, "param0", ctx->params[0], 0);
     av_opt_set_double(ctx->sws, "param1", ctx->params[1], 0);
 
-#if HAVE_AVCODEC_CHROMA_POS_API
+#if LIBAVCODEC_VERSION_MICRO >= 100
     int cr_src = mp_chroma_location_to_av(src->chroma_location);
     int cr_dst = mp_chroma_location_to_av(dst->chroma_location);
     int cr_xpos, cr_ypos;
@@ -288,37 +291,6 @@ int mp_image_sw_blur_scale(struct mp_image *dst, struct mp_image *src,
     int res = mp_sws_scale(ctx, dst, src);
     talloc_free(ctx);
     return res;
-}
-
-int mp_sws_get_vf_equalizer(struct mp_sws_context *sws, struct vf_seteq *eq)
-{
-    if (!sws->supports_csp)
-        return 0;
-    if (!strcmp(eq->item, "brightness"))
-        eq->value =  ((sws->brightness * 100) + (1 << 15)) >> 16;
-    else if (!strcmp(eq->item, "contrast"))
-        eq->value = (((sws->contrast  * 100) + (1 << 15)) >> 16) - 100;
-    else if (!strcmp(eq->item, "saturation"))
-        eq->value = (((sws->saturation * 100) + (1 << 15)) >> 16) - 100;
-    else
-        return 0;
-    return 1;
-}
-
-int mp_sws_set_vf_equalizer(struct mp_sws_context *sws, struct vf_seteq *eq)
-{
-    if (!sws->supports_csp)
-        return 0;
-    if (!strcmp(eq->item, "brightness"))
-        sws->brightness = ((eq->value << 16) + 50) / 100;
-    else if (!strcmp(eq->item, "contrast"))
-        sws->contrast   = MPMAX(1, (((eq->value + 100) << 16) + 50) / 100);
-    else if (!strcmp(eq->item, "saturation"))
-        sws->saturation = (((eq->value + 100) << 16) + 50) / 100;
-    else
-        return 0;
-
-    return mp_sws_reinit(sws) >= 0 ? 1 : -1;
 }
 
 static const int endian_swaps[][2] = {

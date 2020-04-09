@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_M_PROPERTY_H
@@ -48,13 +48,19 @@ enum mp_property_action {
     //  arg: char**
     M_PROPERTY_PRINT,
 
+    // Like M_PROPERTY_GET_TYPE, but get a type that is compatible to the real
+    // type, but reflect practical limits, such as runtime-available values.
+    // This is mostly used for "UI" related things.
+    // (Example: volume property.)
+    M_PROPERTY_GET_CONSTRICTED_TYPE,
+
     // Switch the property up/down by a given value.
     // If unimplemented, the property wrapper uses the property type as
     // fallback.
     //  arg: struct m_property_switch_arg*
     M_PROPERTY_SWITCH,
 
-    // Get a string containing a parsable representation.
+    // Get a string containing a parseable representation.
     // Can't be overridden by property implementations.
     //  arg: char**
     M_PROPERTY_GET_STRING,
@@ -73,14 +79,13 @@ enum mp_property_action {
     //  arg: mpv_node*
     M_PROPERTY_SET_NODE,
 
+    // Multiply numeric property with a factor.
+    //  arg: double*
+    M_PROPERTY_MULTIPLY,
+
     // Pass down an action to a sub-property.
     //  arg: struct m_property_action_arg*
     M_PROPERTY_KEY_ACTION,
-
-    // Get the (usually constant) value that indicates no change. Obscure
-    // special functionality for things like the volume property.
-    // Otherwise works like M_PROPERTY_GET.
-    M_PROPERTY_GET_NEUTRAL,
 };
 
 // Argument for M_PROPERTY_SWITCH
@@ -126,7 +131,12 @@ struct m_property {
     // returns: one of enum mp_property_return
     int (*call)(void *ctx, struct m_property *prop, int action, void *arg);
     void *priv;
+    // Special-case: mark options for which command.c uses the option-bridge
+    bool is_option;
 };
+
+struct m_property *m_property_list_find(const struct m_property *list,
+                                        const char *name);
 
 // Access a property.
 // action: one of m_property_action
@@ -184,6 +194,8 @@ struct m_sub_property {
 // Convenience macros which can be used as part of a sub_property entry.
 #define SUB_PROP_INT(i) \
     .type = {.type = CONF_TYPE_INT}, .value = {.int_ = (i)}
+#define SUB_PROP_INT64(i) \
+    .type = {.type = CONF_TYPE_INT64}, .value = {.int64 = (i)}
 #define SUB_PROP_STR(s) \
     .type = {.type = CONF_TYPE_STRING}, .value = {.string = (char *)(s)}
 #define SUB_PROP_FLOAT(f) \
@@ -192,6 +204,8 @@ struct m_sub_property {
     .type = {.type = CONF_TYPE_DOUBLE}, .value = {.double_ = (f)}
 #define SUB_PROP_FLAG(f) \
     .type = {.type = CONF_TYPE_FLAG}, .value = {.flag = (f)}
+#define SUB_PROP_PTS(f) \
+    .type = {.type = &m_option_type_time}, .value = {.double_ = (f)}
 
 int m_property_read_sub(const struct m_sub_property *props, int action, void *arg);
 

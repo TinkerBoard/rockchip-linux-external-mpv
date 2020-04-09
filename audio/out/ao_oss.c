@@ -42,23 +42,28 @@
 #include "osdep/timer.h"
 #include "osdep/endian.h"
 
-#if HAVE_SYS_SOUNDCARD_H
 #include <sys/soundcard.h>
-#else
-#if HAVE_SOUNDCARD_H
-#include <soundcard.h>
-#endif
-#endif
 
 #include "audio/format.h"
 
 #include "ao.h"
 #include "internal.h"
 
+#if !HAVE_GPL
+#error GPL only
+#endif
+
 // Define to 0 if the device must be reopened to reset it (stop all playback,
 // clear the buffer), and the device should be closed when unused.
 // Define to 1 if SNDCTL_DSP_RESET should be used to reset without close.
-#define KEEP_DEVICE (defined(SNDCTL_DSP_RESET) && !defined(__NetBSD__))
+#if defined(SNDCTL_DSP_RESET) && !defined(__NetBSD__)
+#define KEEP_DEVICE 1
+#else
+#define KEEP_DEVICE 0
+#endif
+
+#define PATH_DEV_DSP "/dev/dsp"
+#define PATH_DEV_MIXER "/dev/mixer"
 
 struct priv {
     int audio_fd;
@@ -70,7 +75,6 @@ struct priv {
     bool device_failed;
     double audio_end;
 
-    char *dsp;
     char *oss_mixer_device;
     char *cfg_oss_mixer_channel;
 };
@@ -94,40 +98,13 @@ static const struct mp_chmap oss_layouts[MP_NUM_CHANNELS + 1] = {
 #define AFMT_S16_NE MP_SELECT_LE_BE(AFMT_S16_LE, AFMT_S16_BE)
 #endif
 
-#if !defined(AFMT_U16_NE) && defined(AFMT_U16_LE) && defined(AFMT_U16_BE)
-#define AFMT_U16_NE MP_SELECT_LE_BE(AFMT_U16_LE, AFMT_U16_BE)
-#endif
-
-#if !defined(AFMT_U24_NE) && defined(AFMT_U24_LE) && defined(AFMT_U24_BE)
-#define AFMT_U24_NE MP_SELECT_LE_BE(AFMT_U24_LE, AFMT_U24_BE)
-#endif
-
-#if !defined(AFMT_S24_NE) && defined(AFMT_S24_LE) && defined(AFMT_S24_BE)
-#define AFMT_S24_NE MP_SELECT_LE_BE(AFMT_S24_LE, AFMT_S24_BE)
-#endif
-
-#if !defined(AFMT_U32_NE) && defined(AFMT_U32_LE) && defined(AFMT_U32_BE)
-#define AFMT_U32_NE AFMT_U32MP_SELECT_LE_BE(AFMT_U32_LE, AFMT_U32_BE)
-#endif
-
 #if !defined(AFMT_S32_NE) && defined(AFMT_S32_LE) && defined(AFMT_S32_BE)
 #define AFMT_S32_NE AFMT_S32MP_SELECT_LE_BE(AFMT_S32_LE, AFMT_S32_BE)
 #endif
 
 static const int format_table[][2] = {
     {AFMT_U8,           AF_FORMAT_U8},
-    {AFMT_S8,           AF_FORMAT_S8},
-    {AFMT_U16_NE,       AF_FORMAT_U16},
     {AFMT_S16_NE,       AF_FORMAT_S16},
-#ifdef AFMT_U24_NE
-    {AFMT_U24_NE,       AF_FORMAT_U24},
-#endif
-#ifdef AFMT_S24_NE
-    {AFMT_S24_NE,       AF_FORMAT_S24},
-#endif
-#ifdef AFMT_U32_NE
-    {AFMT_U32_NE,       AF_FORMAT_U32},
-#endif
 #ifdef AFMT_S32_NE
     {AFMT_S32_NE,       AF_FORMAT_S32},
 #endif
@@ -204,7 +181,7 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
             return CONTROL_OK;
 #endif
 
-        if (AF_FORMAT_IS_SPECIAL(ao->format))
+        if (!af_fmt_is_pcm(ao->format))
             return CONTROL_TRUE;
 
         if ((fd = open(p->oss_mixer_device, O_RDONLY)) != -1) {
@@ -267,7 +244,7 @@ static bool try_format(struct ao *ao, int *format)
     struct priv *p = ao->priv;
 
     int oss_format = format2oss(*format);
-    if (oss_format == -1 && AF_FORMAT_IS_IEC61937(*format))
+    if (oss_format == -1 && af_fmt_is_spdif(*format))
         oss_format = AFMT_AC3;
 
     if (oss_format == -1) {
@@ -299,14 +276,19 @@ static int reopen_device(struct ao *ao, bool allow_format_changes)
     int format = ao->format;
     struct mp_chmap channels = ao->channels;
 
+    const char *device = PATH_DEV_DSP;
+    if (ao->device)
+        device = ao->device;
+
+    MP_VERBOSE(ao, "using '%s' dsp device\n", device);
 #ifdef __linux__
-    p->audio_fd = open(p->dsp, O_WRONLY | O_NONBLOCK);
+    p->audio_fd = open(device, O_WRONLY | O_NONBLOCK);
 #else
-    p->audio_fd = open(p->dsp, O_WRONLY);
+    p->audio_fd = open(device, O_WRONLY);
 #endif
     if (p->audio_fd < 0) {
         MP_ERR(ao, "Can't open audio device %s: %s\n",
-               p->dsp, mp_strerror(errno));
+               device, mp_strerror(errno));
         goto fail;
     }
 
@@ -323,7 +305,7 @@ static int reopen_device(struct ao *ao, bool allow_format_changes)
     fcntl(p->audio_fd, F_SETFD, FD_CLOEXEC);
 #endif
 
-    if (AF_FORMAT_IS_IEC61937(format)) {
+    if (af_fmt_is_spdif(format)) {
         if (ioctl(p->audio_fd, SNDCTL_DSP_SPEED, &samplerate) == -1)
             goto fail;
         // Probably could be fixed by setting number of channels; needs testing.
@@ -333,7 +315,8 @@ static int reopen_device(struct ao *ao, bool allow_format_changes)
         }
     }
 
-    int try_formats[] = {format, AF_FORMAT_S32, AF_FORMAT_S24, AF_FORMAT_S16, 0};
+    int try_formats[AF_FORMAT_COUNT + 1];
+    af_get_best_sample_formats(format, try_formats);
     for (int n = 0; try_formats[n]; n++) {
         format = try_formats[n];
         if (try_format(ao, &format))
@@ -347,7 +330,7 @@ static int reopen_device(struct ao *ao, bool allow_format_changes)
 
     MP_VERBOSE(ao, "sample format: %s\n", af_fmt_to_str(format));
 
-    if (!AF_FORMAT_IS_IEC61937(format)) {
+    if (!af_fmt_is_spdif(format)) {
         struct mp_chmap_sel sel = {0};
         for (int n = 0; n < MP_NUM_CHANNELS + 1; n++)
             mp_chmap_sel_add_map(&sel, &oss_layouts[n]);
@@ -412,7 +395,9 @@ static int reopen_device(struct ao *ao, bool allow_format_changes)
         }
     }
 
-    p->outburst -= p->outburst % (channels.num * af_fmt2bps(format)); // round down
+    int sstride = channels.num * af_fmt_to_bytes(format);
+    p->outburst -= p->outburst % sstride; // round down
+    ao->period_size = p->outburst / sstride;
 
     return 0;
 
@@ -462,9 +447,8 @@ static int init(struct ao *ao)
         p->oss_mixer_channel = SOUND_MIXER_PCM;
     }
 
-    MP_VERBOSE(ao, "using '%s' dsp device\n", p->dsp);
     MP_VERBOSE(ao, "using '%s' mixer device\n", p->oss_mixer_device);
-    MP_VERBOSE(ao, "using '%s' mixer device\n", mixer_channels[p->oss_mixer_channel]);
+    MP_VERBOSE(ao, "using '%s' mixer channel\n", mixer_channels[p->oss_mixer_channel]);
 
     ao->format = af_fmt_from_planar(ao->format);
 
@@ -481,7 +465,7 @@ static int init(struct ao *ao)
         p->buffersize = 0;
         memset(data, 0, p->outburst);
         while (p->buffersize < 0x40000 && device_writable(ao) > 0) {
-            write(p->audio_fd, data, p->outburst);
+            (void)write(p->audio_fd, data, p->outburst);
             p->buffersize += p->outburst;
         }
         free(data);
@@ -631,6 +615,12 @@ static int audio_wait(struct ao *ao, pthread_mutex_t *lock)
     return r;
 }
 
+static void list_devs(struct ao *ao, struct ao_device_list *list)
+{
+    if (stat(PATH_DEV_DSP, &(struct stat){0}) == 0)
+        ao_device_list_add(list, ao, &(struct ao_device_desc){"", "Default"});
+}
+
 #define OPT_BASE_STRUCT struct priv
 
 const struct ao_driver audio_out_oss = {
@@ -648,6 +638,7 @@ const struct ao_driver audio_out_oss = {
     .drain     = drain,
     .wait      = audio_wait,
     .wakeup    = ao_wakeup_poll,
+    .list_devs = list_devs,
     .priv_size = sizeof(struct priv),
     .priv_defaults = &(const struct priv) {
         .audio_fd = -1,
@@ -655,14 +646,12 @@ const struct ao_driver audio_out_oss = {
         .buffersize = -1,
         .outburst = 512,
         .oss_mixer_channel = SOUND_MIXER_PCM,
-
-        .dsp = PATH_DEV_DSP,
         .oss_mixer_device = PATH_DEV_MIXER,
     },
     .options = (const struct m_option[]) {
-        OPT_STRING("device", dsp, 0),
         OPT_STRING("mixer-device", oss_mixer_device, 0),
         OPT_STRING("mixer-channel", cfg_oss_mixer_channel, 0),
         {0}
     },
+    .options_prefix = "oss",
 };

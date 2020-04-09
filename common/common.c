@@ -1,29 +1,32 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdarg.h>
+#include <math.h>
 #include <assert.h>
 
 #include <libavutil/common.h>
 #include <libavutil/error.h>
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "misc/bstr.h"
+#include "misc/ctype.h"
 #include "common/common.h"
+#include "osdep/strnlen.h"
 
 #define appendf(ptr, ...) \
     do {(*(ptr)) = talloc_asprintf_append_buffer(*(ptr), __VA_ARGS__);} while(0)
@@ -46,14 +49,17 @@ char *mp_format_time_fmt(const char *fmt, double time)
     time = time < 0 ? -time : time;
     long long int itime = time;
     long long int h, m, tm, s;
-    int ms;
+    int ms = lrint((time - itime) * 1000);
+    if (ms >= 1000) {
+        ms -= 1000;
+        itime += 1;
+    }
     s = itime;
     tm = s / 60;
     h = s / 3600;
     s -= h * 3600;
     m = s / 60;
     s -= m * 60;
-    ms = (time - itime) * 1000;
     char *res = talloc_strdup(NULL, "");
     while (*fmt) {
         if (fmt[0] == '%') {
@@ -66,6 +72,7 @@ char *mp_format_time_fmt(const char *fmt, double time)
             case 's': appendf(&res, "%s%lld", sign, itime); break;
             case 'S': appendf(&res, "%02lld", s); break;
             case 'T': appendf(&res, "%03d", ms); break;
+            case 'f': appendf(&res, "%f", time); break;
             case '%': appendf(&res, "%s", "%"); break;
             default: goto error;
             }
@@ -113,6 +120,12 @@ bool mp_rect_intersection(struct mp_rect *rc, const struct mp_rect *rc2)
     return rc->x1 > rc->x0 && rc->y1 > rc->y0;
 }
 
+bool mp_rect_equals(struct mp_rect *rc1, struct mp_rect *rc2)
+{
+    return rc1->x0 == rc2->x0 && rc1->y0 == rc2->y0 &&
+           rc1->x1 == rc2->x1 && rc1->y1 == rc2->y1;
+}
+
 // This works like snprintf(), except that it starts writing the first output
 // character to str[strlen(str)]. This returns the number of characters the
 // string would have *appended* assuming a large enough buffer, will make sure
@@ -148,7 +161,7 @@ void mp_append_utf8_bstr(void *talloc_ctx, struct bstr *buf, uint32_t codepoint)
     bstr_xappend(talloc_ctx, buf, (bstr){data, output - data});
 }
 
-// Parse a C-style escape beginning at code, and append the result to *str
+// Parse a C/JSON-style escape beginning at code, and append the result to *str
 // using talloc. The input string (*code) must point to the first character
 // after the initial '\', and after parsing *code is set to the first character
 // after the current escape.
@@ -161,6 +174,7 @@ static bool mp_parse_escape(void *talloc_ctx, bstr *dst, bstr *code)
     switch (code->start[0]) {
     case '"':  replace = '"';  break;
     case '\\': replace = '\\'; break;
+    case '/':  replace = '/'; break;
     case 'b':  replace = '\b'; break;
     case 'f':  replace = '\f'; break;
     case 'n':  replace = '\n'; break;
@@ -185,9 +199,20 @@ static bool mp_parse_escape(void *talloc_ctx, bstr *dst, bstr *code)
     }
     if (code->start[0] == 'u' && code->len >= 5) {
         bstr num = bstr_splice(*code, 1, 5);
-        int c = bstrtoll(num, &num, 16);
+        uint32_t c = bstrtoll(num, &num, 16);
         if (num.len)
             return false;
+        if (c >= 0xd800 && c <= 0xdbff) {
+            if (code->len < 5 + 6 // udddd + \udddd
+                || code->start[5] != '\\' || code->start[6] != 'u')
+                return false;
+            *code = bstr_cut(*code, 5 + 1);
+            bstr num2 = bstr_splice(*code, 1, 5);
+            uint32_t c2 = bstrtoll(num2, &num2, 16);
+            if (num2.len || c2 < 0xdc00 || c2 > 0xdfff)
+                return false;
+            c = ((c - 0xd800) << 10) + 0x10000 + (c2 - 0xdc00);
+        }
         mp_append_utf8_bstr(talloc_ctx, dst, c);
         *code = bstr_cut(*code, 5);
         return true;
@@ -256,4 +281,40 @@ char *mp_strerror_buf(char *buf, size_t buf_size, int errnum)
     // This handles the nasty details of calling the right function for us.
     av_strerror(AVERROR(errnum), buf, buf_size);
     return buf;
+}
+
+char *mp_tag_str_buf(char *buf, size_t buf_size, uint32_t tag)
+{
+    if (buf_size < 1)
+        return buf;
+    buf[0] = '\0';
+    for (int n = 0; n < 4; n++) {
+        uint8_t val = (tag >> (n * 8)) & 0xFF;
+        if (mp_isalnum(val) || val == '_' || val == ' ') {
+            mp_snprintf_cat(buf, buf_size, "%c", val);
+        } else {
+            mp_snprintf_cat(buf, buf_size, "[%d]", val);
+        }
+    }
+    return buf;
+}
+
+char *mp_tprintf_buf(char *buf, size_t buf_size, const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(buf, buf_size, format, ap);
+    va_end(ap);
+    return buf;
+}
+
+char **mp_dup_str_array(void *tctx, char **s)
+{
+    char **r = NULL;
+    int num_r = 0;
+    for (int n = 0; s && s[n]; n++)
+        MP_TARRAY_APPEND(tctx, r, num_r, talloc_strdup(tctx, s[n]));
+    if (r)
+        MP_TARRAY_APPEND(tctx, r, num_r, NULL);
+    return r;
 }

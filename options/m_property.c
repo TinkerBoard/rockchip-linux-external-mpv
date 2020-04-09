@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /// \file
@@ -30,57 +30,40 @@
 
 #include "libmpv/client.h"
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "m_option.h"
 #include "m_property.h"
 #include "common/msg.h"
 #include "common/common.h"
 
-struct legacy_prop {
-    const char *old, *new;
-};
-static const struct legacy_prop legacy_props[] = {
-    {"switch_video",    "video"},
-    {"switch_audio",    "audio"},
-    {"switch_program",  "program"},
-    {"framedropping",   "framedrop"},
-    {"osdlevel",        "osd-level"},
-    {0}
-};
-
-static bool translate_legacy_property(struct mp_log *log, const char *name,
-                                      char *buffer, size_t buffer_size)
+static int m_property_multiply(struct mp_log *log,
+                               const struct m_property *prop_list,
+                               const char *property, double f, void *ctx)
 {
-    if (strlen(name) + 1 > buffer_size)
-        return false;
+    union m_option_value val = {0};
+    struct m_option opt = {0};
+    int r;
 
-    const char *old_name = name;
+    r = m_property_do(log, prop_list, property, M_PROPERTY_GET_CONSTRICTED_TYPE,
+                      &opt, ctx);
+    if (r != M_PROPERTY_OK)
+        return r;
+    assert(opt.type);
 
-    for (int n = 0; legacy_props[n].new; n++) {
-        if (strcmp(name, legacy_props[n].old) == 0) {
-            name = legacy_props[n].new;
-            break;
-        }
-    }
+    if (!opt.type->multiply)
+        return M_PROPERTY_NOT_IMPLEMENTED;
 
-    snprintf(buffer, buffer_size, "%s", name);
-
-    // Old names used "_" instead of "-"
-    for (int n = 0; buffer[n]; n++) {
-        if (buffer[n] == '_')
-            buffer[n] = '-';
-    }
-
-    if (log && strcmp(old_name, buffer) != 0) {
-        mp_warn(log, "Warning: property '%s' is deprecated, replaced with '%s'."
-                " Fix your input.conf!\n", old_name, buffer);
-    }
-
-    return true;
+    r = m_property_do(log, prop_list, property, M_PROPERTY_GET, &val, ctx);
+    if (r != M_PROPERTY_OK)
+        return r;
+    opt.type->multiply(&opt, &val, f);
+    r = m_property_do(log, prop_list, property, M_PROPERTY_SET, &val, ctx);
+    m_option_free(&opt, &val);
+    return r;
 }
 
-static struct m_property *m_property_list_find(const struct m_property *list,
-                                                     const char *name)
+struct m_property *m_property_list_find(const struct m_property *list,
+                                        const char *name)
 {
     for (int n = 0; list && list[n].name; n++) {
         if (strcmp(list[n].name, name) == 0)
@@ -92,14 +75,12 @@ static struct m_property *m_property_list_find(const struct m_property *list,
 static int do_action(const struct m_property *prop_list, const char *name,
                      int action, void *arg, void *ctx)
 {
-    const char *sep;
     struct m_property *prop;
     struct m_property_action_arg ka;
-    if ((sep = strchr(name, '/')) && sep[1]) {
-        int len = sep - name;
-        char base[len + 1];
-        memcpy(base, name, len);
-        base[len] = 0;
+    const char *sep = strchr(name, '/');
+    if (sep && sep[1]) {
+        char base[128];
+        snprintf(base, sizeof(base), "%.*s", (int)(sep - name), name);
         prop = m_property_list_find(prop_list, base);
         ka = (struct m_property_action_arg) {
             .key = sep + 1,
@@ -117,14 +98,10 @@ static int do_action(const struct m_property *prop_list, const char *name,
 
 // (as a hack, log can be NULL on read-only paths)
 int m_property_do(struct mp_log *log, const struct m_property *prop_list,
-                  const char *in_name, int action, void *arg, void *ctx)
+                  const char *name, int action, void *arg, void *ctx)
 {
     union m_option_value val = {0};
     int r;
-
-    char name[64];
-    if (!translate_legacy_property(log, in_name, name, sizeof(name)))
-        return M_PROPERTY_UNKNOWN;
 
     struct m_option opt = {0};
     r = do_action(prop_list, name, M_PROPERTY_GET_TYPE, &opt, ctx);
@@ -153,16 +130,11 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
         return str != NULL;
     }
     case M_PROPERTY_SET_STRING: {
-        if (!log)
-            return M_PROPERTY_ERROR;
-        bstr optname = bstr0(name), a, b;
-        if (bstr_split_tok(optname, "/", &a, &b))
-            optname = b;
-        if (m_option_parse(log, &opt, optname, bstr0(arg), &val) < 0)
-            return M_PROPERTY_ERROR;
-        r = do_action(prop_list, name, M_PROPERTY_SET, &val, ctx);
-        m_option_free(&opt, &val);
-        return r;
+        struct mpv_node node = { .format = MPV_FORMAT_STRING, .u.string = arg };
+        return m_property_do(log, prop_list, name, M_PROPERTY_SET_NODE, &node, ctx);
+    }
+    case M_PROPERTY_MULTIPLY: {
+        return m_property_multiply(log, prop_list, name, *(double *)arg, ctx);
     }
     case M_PROPERTY_SWITCH: {
         if (!log)
@@ -172,6 +144,11 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
             M_PROPERTY_NOT_IMPLEMENTED)
             return r;
         // Fallback to m_option
+        r = m_property_do(log, prop_list, name, M_PROPERTY_GET_CONSTRICTED_TYPE,
+                          &opt, ctx);
+        if (r <= 0)
+            return r;
+        assert(opt.type);
         if (!opt.type->add)
             return M_PROPERTY_NOT_IMPLEMENTED;
         if ((r = do_action(prop_list, name, M_PROPERTY_GET, &val, ctx)) <= 0)
@@ -181,16 +158,14 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
         m_option_free(&opt, &val);
         return r;
     }
+    case M_PROPERTY_GET_CONSTRICTED_TYPE: {
+        if ((r = do_action(prop_list, name, action, arg, ctx)) >= 0)
+            return r;
+        if ((r = do_action(prop_list, name, M_PROPERTY_GET_TYPE, arg, ctx)) >= 0)
+            return r;
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    }
     case M_PROPERTY_SET: {
-        if (!log)
-            return M_PROPERTY_ERROR;
-        m_option_copy(&opt, &val, arg);
-        r = opt.type->clamp ? opt.type->clamp(&opt, arg) : 0;
-        m_option_free(&opt, &val);
-        if (r != 0) {
-            mp_err(log, "Property '%s': invalid value.\n", name);
-            return M_PROPERTY_ERROR;
-        }
         return do_action(prop_list, name, M_PROPERTY_SET, arg, ctx);
     }
     case M_PROPERTY_GET_NODE: {
@@ -212,11 +187,12 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
         return r;
     }
     case M_PROPERTY_SET_NODE: {
+        if (!log)
+            return M_PROPERTY_ERROR;
         if ((r = do_action(prop_list, name, M_PROPERTY_SET_NODE, arg, ctx)) !=
             M_PROPERTY_NOT_IMPLEMENTED)
             return r;
-        struct mpv_node *node = arg;
-        int err = m_option_set_node(&opt, &val, node);
+        int err = m_option_set_node_or_string(log, &opt, name, &val, arg);
         if (err == M_OPT_UNKNOWN) {
             r = M_PROPERTY_NOT_IMPLEMENTED;
         } else if (err < 0) {

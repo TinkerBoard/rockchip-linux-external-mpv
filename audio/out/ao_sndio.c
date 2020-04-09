@@ -99,8 +99,7 @@ static const struct mp_chmap sndio_layouts[MP_NUM_CHANNELS + 1] = {
     MP_CHMAP8(FL, FR, BL, BR, FC, LFE, SL, SR), // 7.1
     /* above is the fixed channel assignment for sndio, since we need to fill
        all channels and cannot insert silence, not all layouts are supported.
-       NOTE: MP_SPEAKER_ID_NA could be used to add padding channels. Keep
-             in mind that they don't actually contain silence. */
+       NOTE: MP_SPEAKER_ID_NA could be used to add padding channels. */
 };
 
 /*
@@ -116,20 +115,15 @@ static int init(struct ao *ao)
     };
     static const struct af_to_par af_to_par[] = {
         {AF_FORMAT_U8,   8, 0},
-        {AF_FORMAT_S8,   8, 1},
-        {AF_FORMAT_U16, 16, 0},
         {AF_FORMAT_S16, 16, 1},
-        {AF_FORMAT_U24, 24, 0},
-        {AF_FORMAT_S24, 24, 1},
-        {AF_FORMAT_U32, 32, 0},
         {AF_FORMAT_S32, 32, 1},
     };
     const struct af_to_par *ap;
     int i;
 
-    p->hdl = sio_open(p->dev, SIO_PLAY, 0);
+    p->hdl = sio_open(SIO_DEVANY, SIO_PLAY, 0);
     if (p->hdl == NULL) {
-        MP_ERR(ao, "can't open sndio %s\n", p->dev);
+        MP_ERR(ao, "can't open sndio %s\n", SIO_DEVANY);
         goto error;
     }
 
@@ -178,14 +172,12 @@ static int init(struct ao *ao)
         MP_ERR(ao, "swapped endian output not supported\n");
         goto error;
     }
-    if (p->par.bits == 8 && p->par.bps == 1) {
-        ao->format = p->par.sig ? AF_FORMAT_S8 : AF_FORMAT_U8;
-    } else if (p->par.bits == 16 && p->par.bps == 2) {
-        ao->format = p->par.sig ? AF_FORMAT_S16 : AF_FORMAT_U16;
-    } else if ((p->par.bits == 24 || p->par.msb) && p->par.bps == 3) {
-        ao->format = p->par.sig ? AF_FORMAT_S24 : AF_FORMAT_U24;
-    } else if ((p->par.bits == 32 || p->par.msb) && p->par.bps == 4) {
-        ao->format = p->par.sig ? AF_FORMAT_S32 : AF_FORMAT_U32;
+    if (p->par.bits == 8 && p->par.bps == 1 && !p->par.sig) {
+        ao->format = AF_FORMAT_U8;
+    } else if (p->par.bits == 16 && p->par.bps == 2 && p->par.sig) {
+        ao->format = AF_FORMAT_S16;
+    } else if ((p->par.bits == 32 || p->par.msb) && p->par.bps == 4 && p->par.sig) {
+        ao->format = AF_FORMAT_S32;
     } else {
         MP_ERR(ao, "couldn't set format\n");
         goto error;
@@ -199,6 +191,8 @@ static int init(struct ao *ao)
     p->pfd = calloc (sio_nfds(p->hdl), sizeof (struct pollfd));
     if (!p->pfd)
         goto error;
+
+    ao->period_size = p->par.round;
 
     return 0;
 
@@ -324,8 +318,4 @@ const struct ao_driver audio_out_sndio = {
     .resume    = audio_resume,
     .reset     = reset,
     .priv_size = sizeof(struct priv),
-    .options = (const struct m_option[]) {
-        OPT_STRING("device", dev, 0, OPTDEF_STR(SIO_DEVANY)),
-        {0}
-    },
 };

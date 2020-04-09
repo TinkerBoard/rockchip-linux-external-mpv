@@ -1,3 +1,25 @@
+/*
+ * Copyright (C) 2001 Alex Beregszaszi
+ *
+ * Feb 19, 2002: Significant rewrites by Charles R. Henrich (henrich@msu.edu)
+ *               to add support for audio, and bktr *BSD support.
+ *
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #include <assert.h>
 
 #include "common/common.h"
@@ -11,7 +33,6 @@
 #include "codec_tags.h"
 
 #include "audio/format.h"
-#include "video/img_fourcc.h"
 #include "osdep/endian.h"
 
 #include "stream/stream.h"
@@ -20,22 +41,31 @@
 static int demux_open_tv(demuxer_t *demuxer, enum demux_check check)
 {
     tvi_handle_t *tvh;
-    sh_video_t *sh_video;
-    sh_audio_t *sh_audio = NULL;
     const tvi_functions_t *funcs;
 
-    if (check > DEMUX_CHECK_REQUEST || demuxer->stream->type != STREAMTYPE_TV)
+    if (check > DEMUX_CHECK_REQUEST)
         return -1;
 
-    tv_param_t *params = m_sub_options_copy(demuxer, &tv_params_conf,
-                                            demuxer->opts->tv_params);
-    struct tv_stream_params *sparams = demuxer->stream->priv;
-    if (sparams->channel && sparams->channel[0]) {
+    if (!demuxer->stream->info || strcmp(demuxer->stream->info->name, "tv") != 0)
+        return -1;
+
+    tv_param_t *params = mp_get_config_group(demuxer, demuxer->global,
+                                             &tv_params_conf);
+    bstr urlparams = bstr0(demuxer->stream->path);
+    bstr channel, input;
+    bstr_split_tok(urlparams, "/", &channel, &input);
+    if (channel.len) {
         talloc_free(params->channel);
-        params->channel = talloc_strdup(NULL, sparams->channel);
+        params->channel = bstrto0(NULL, channel);
     }
-    if (sparams->input >= 0)
-        params->input = sparams->input;
+    if (input.len) {
+        bstr r;
+        params->input = bstrtoll(input, &r, 0);
+        if (r.len) {
+            MP_ERR(demuxer->stream, "invalid input: '%.*s'\n", BSTR_P(input));
+            return -1;
+        }
+    }
 
     assert(demuxer->priv==NULL);
     if(!(tvh=tv_begin(params, demuxer->log))) return -1;
@@ -50,31 +80,30 @@ static int demux_open_tv(demuxer_t *demuxer, enum demux_check check)
     funcs = tvh->functions;
     demuxer->priv=tvh;
 
-    struct sh_stream *sh_v = new_sh_stream(demuxer, STREAM_VIDEO);
-    sh_video = sh_v->video;
+    struct sh_stream *sh_v = demux_alloc_sh_stream(STREAM_VIDEO);
 
     /* get IMAGE FORMAT */
     int fourcc;
     funcs->control(tvh->priv, TVI_CONTROL_VID_GET_FORMAT, &fourcc);
-    if (fourcc == MP_FOURCC_MJPEG) {
-        sh_v->codec = "mjpeg";
+    if (fourcc == MP_FOURCC_MJPEG || fourcc == MP_FOURCC_JPEG) {
+        sh_v->codec->codec = "mjpeg";
     } else {
-        sh_v->codec = "rawvideo";
-        sh_v->format = fourcc;
+        sh_v->codec->codec = "rawvideo";
+        sh_v->codec->codec_tag = fourcc;
     }
 
     /* set FPS and FRAMETIME */
 
-    if(!sh_video->fps)
+    if(!sh_v->codec->fps)
     {
         float tmp;
         if (funcs->control(tvh->priv, TVI_CONTROL_VID_GET_FPS, &tmp) != TVI_CONTROL_TRUE)
-             sh_video->fps = 25.0f; /* on PAL */
-        else sh_video->fps = tmp;
+             sh_v->codec->fps = 25.0f; /* on PAL */
+        else sh_v->codec->fps = tmp;
     }
 
     if (tvh->tv_param->fps != -1.0f)
-        sh_video->fps = tvh->tv_param->fps;
+        sh_v->codec->fps = tvh->tv_param->fps;
 
     /* If playback only mode, go to immediate mode, fail silently */
     if(tvh->tv_param->immediate == 1)
@@ -84,10 +113,12 @@ static int demux_open_tv(demuxer_t *demuxer, enum demux_check check)
         }
 
     /* set width */
-    funcs->control(tvh->priv, TVI_CONTROL_VID_GET_WIDTH, &sh_video->disp_w);
+    funcs->control(tvh->priv, TVI_CONTROL_VID_GET_WIDTH, &sh_v->codec->disp_w);
 
     /* set height */
-    funcs->control(tvh->priv, TVI_CONTROL_VID_GET_HEIGHT, &sh_video->disp_h);
+    funcs->control(tvh->priv, TVI_CONTROL_VID_GET_HEIGHT, &sh_v->codec->disp_h);
+
+    demux_add_sh_stream(demuxer, sh_v);
 
     demuxer->seekable = 0;
 
@@ -115,21 +146,22 @@ static int demux_open_tv(demuxer_t *demuxer, enum demux_check check)
                 goto no_audio;
         }
 
-        struct sh_stream *sh_a = new_sh_stream(demuxer, STREAM_AUDIO);
-        sh_audio = sh_a->audio;
+        struct sh_stream *sh_a = demux_alloc_sh_stream(STREAM_AUDIO);
 
         funcs->control(tvh->priv, TVI_CONTROL_AUD_GET_SAMPLERATE,
-                   &sh_audio->samplerate);
-        int nchannels = sh_audio->channels.num;
+                   &sh_a->codec->samplerate);
+        int nchannels = sh_a->codec->channels.num;
         funcs->control(tvh->priv, TVI_CONTROL_AUD_GET_CHANNELS,
                    &nchannels);
-        mp_chmap_from_channels(&sh_audio->channels, nchannels);
+        mp_chmap_from_channels(&sh_a->codec->channels, nchannels);
 
         // s16ne
-        mp_set_pcm_codec(sh_a, true, false, 16, BYTE_ORDER == BIG_ENDIAN);
+        mp_set_pcm_codec(sh_a->codec, true, false, 16, BYTE_ORDER == BIG_ENDIAN);
+
+        demux_add_sh_stream(demuxer, sh_a);
 
         MP_VERBOSE(tvh, "  TV audio: %d channels, %d bits, %d Hz\n",
-                   nchannels, 16, sh_audio->samplerate);
+                   nchannels, 16, sh_a->codec->samplerate);
     }
 no_audio:
 
@@ -168,8 +200,9 @@ static int demux_tv_fill_buffer(demuxer_t *demux)
     unsigned int len=0;
     struct sh_stream *want_audio = NULL, *want_video = NULL;
 
-    for (int n = 0; n < demux->num_streams; n++) {
-        struct sh_stream *sh = demux->streams[n];
+    int num_streams = demux_get_num_stream(demux);
+    for (int n = 0; n < num_streams; n++) {
+        struct sh_stream *sh = demux_get_stream(demux, n);
         if (!demux_has_packet(sh) && demux_stream_is_selected(sh)) {
             if (sh->type == STREAM_AUDIO)
                 want_audio = sh;
@@ -216,10 +249,10 @@ static int demux_tv_control(demuxer_t *demuxer, int cmd, void *arg)
 {
     tvi_handle_t *tvh=(tvi_handle_t*)(demuxer->priv);
     if (cmd != DEMUXER_CTRL_STREAM_CTRL)
-        return DEMUXER_CTRL_NOTIMPL;
+        return CONTROL_UNKNOWN;
     struct demux_ctrl_stream_ctrl *ctrl = arg;
     ctrl->res = tv_stream_control(tvh, ctrl->ctrl, ctrl->arg);
-    return DEMUXER_CTRL_OK;
+    return CONTROL_OK;
 }
 
 const demuxer_desc_t demuxer_desc_tv = {

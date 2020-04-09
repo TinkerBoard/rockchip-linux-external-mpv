@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdlib.h>
@@ -29,13 +29,13 @@
 
 #include "osdep/io.h"
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #include "common/msg.h"
-#include "common/global.h"
 #include "demux/demux.h"
 #include "demux/timeline.h"
 #include "demux/matroska.h"
+#include "options/m_config.h"
 #include "options/options.h"
 #include "options/path.h"
 #include "misc/bstr.h"
@@ -46,6 +46,7 @@
 struct tl_ctx {
     struct mp_log *log;
     struct mpv_global *global;
+    struct MPOpts *opts;
     struct timeline *tl;
 
     struct demuxer *demuxer;
@@ -118,7 +119,7 @@ static char **find_files(const char *original_file)
         if (!strcmp(ep->d_name, basename))
             continue;
 
-        char *name = mp_path_join(results, directory, bstr0(ep->d_name));
+        char *name = mp_path_join_bstr(results, directory, bstr0(ep->d_name));
         char *s1 = ep->d_name;
         char *s2 = basename;
         int matchlen = 0;
@@ -169,6 +170,7 @@ static bool check_file_seg(struct tl_ctx *ctx, char *filename, int segment)
         .matroska_wanted_uids = ctx->uids,
         .matroska_wanted_segment = segment,
         .matroska_was_valid = &was_valid,
+        .disable_timeline = true,
         .disable_cache = true,
     };
     struct mp_cancel *cancel = ctx->tl->cancel;
@@ -186,31 +188,34 @@ static bool check_file_seg(struct tl_ctx *ctx, char *filename, int segment)
         if (ctx->sources[i])
             continue;
         /* Accept the source if the segment uid matches and the edition
-            * either matches or isn't specified. */
+         * either matches or isn't specified. */
         if (!memcmp(uid->segment, m->uid.segment, 16) &&
             (!uid->edition || uid->edition == m->uid.edition))
         {
             MP_INFO(ctx, "Match for source %d: %s\n", i, d->filename);
 
-            for (int j = 0; j < m->num_ordered_chapters; j++) {
-                struct matroska_chapter *c = m->ordered_chapters + j;
+            if (!uid->edition) {
+                m->uid.edition = 0;
+            } else {
+                for (int j = 0; j < m->num_ordered_chapters; j++) {
+                    struct matroska_chapter *c = m->ordered_chapters + j;
 
-                if (!c->has_segment_uid)
-                    continue;
+                    if (!c->has_segment_uid)
+                        continue;
 
-                if (has_source_request(ctx, &c->uid))
-                    continue;
+                    if (has_source_request(ctx, &c->uid))
+                        continue;
 
-                /* Set the requested segment. */
-                MP_TARRAY_GROW(NULL, ctx->uids, ctx->num_sources);
-                ctx->uids[ctx->num_sources] = c->uid;
+                    /* Set the requested segment. */
+                    MP_TARRAY_GROW(NULL, ctx->uids, ctx->num_sources);
+                    ctx->uids[ctx->num_sources] = c->uid;
 
-                /* Add a new source slot. */
-                MP_TARRAY_APPEND(NULL, ctx->sources, ctx->num_sources, NULL);
+                    /* Add a new source slot. */
+                    MP_TARRAY_APPEND(NULL, ctx->sources, ctx->num_sources, NULL);
+                }
             }
 
-            if (stream_wants_cache(d->stream, &ctx->global->opts->stream_cache))
-            {
+            if (stream_wants_cache(d->stream, ctx->opts->stream_cache)) {
                 free_demuxer_and_stream(d);
                 params.disable_cache = false;
                 params.matroska_wanted_uids = ctx->uids; // potentially reallocated, same data
@@ -247,7 +252,7 @@ static bool missing(struct tl_ctx *ctx)
 
 static void find_ordered_chapter_sources(struct tl_ctx *ctx)
 {
-    struct MPOpts *opts = ctx->global->opts;
+    struct MPOpts *opts = ctx->opts;
     void *tmp = talloc_new(NULL);
     int num_filenames = 0;
     char **filenames = NULL;
@@ -260,9 +265,9 @@ static void find_ordered_chapter_sources(struct tl_ctx *ctx)
             struct playlist *pl =
                 playlist_parse_file(opts->ordered_chapters_files, ctx->global);
             talloc_steal(tmp, pl);
-            for (struct playlist_entry *e = pl->first; e; e = e->next)
+            for (struct playlist_entry *e = pl ? pl->first : NULL; e; e = e->next)
                 MP_TARRAY_APPEND(tmp, filenames, num_filenames, e->filename);
-        } else if (ctx->demuxer->stream->uncached_type != STREAMTYPE_FILE) {
+        } else if (!ctx->demuxer->stream->is_local_file) {
             MP_WARN(ctx, "Playback source is not a "
                     "normal disk file. Will not search for related files.\n");
         } else {
@@ -317,7 +322,7 @@ static int64_t add_timeline_part(struct tl_ctx *ctx,
      * early; we don't want to try seeking over a one frame gap. */
     int64_t join_diff = start - ctx->last_end_time;
     if (ctx->num_parts == 0
-        || FFABS(join_diff) > ctx->global->opts->chapter_merge_threshold * 1e6
+        || FFABS(join_diff) > ctx->opts->chapter_merge_threshold * 1e6
         || source != ctx->timeline[ctx->num_parts - 1].source)
     {
         struct timeline_part new = {
@@ -372,14 +377,14 @@ static void build_timeline_loop(struct tl_ctx *ctx,
                     break; // malformed files can cause this to happen.
 
                 chapters[i].pts = ctx->start_time / 1e9;
-                chapters[i].name = talloc_strdup(chapters, c->name);
+                chapters[i].metadata = talloc_zero(chapters, struct mp_tags);
+                mp_tags_set_str(chapters[i].metadata, "title", c->name);
             }
 
             /* If we're the source or it's a non-ordered edition reference,
              * just add a timeline part from the source. */
-            if (current_source == j || !linked_m->num_ordered_chapters) {
-                uint64_t source_full_length =
-                    demuxer_get_time_length(linked_source) * 1e9;
+            if (current_source == j || !linked_m->uid.edition) {
+                uint64_t source_full_length = linked_source->duration * 1e9;
                 uint64_t source_length = source_full_length - c->start;
                 int64_t join_diff = 0;
 
@@ -457,8 +462,9 @@ static void check_track_compatibility(struct timeline *tl)
         if (p->source == mainsrc)
             continue;
 
-        for (int i = 0; i < p->source->num_streams; i++) {
-            struct sh_stream *s = p->source->streams[i];
+        int num_source_streams = demux_get_num_stream(p->source);
+        for (int i = 0; i < num_source_streams; i++) {
+            struct sh_stream *s = demux_get_stream(p->source, i);
             if (s->attached_picture)
                 continue;
 
@@ -472,8 +478,9 @@ static void check_track_compatibility(struct timeline *tl)
             }
         }
 
-        for (int i = 0; i < mainsrc->num_streams; i++) {
-            struct sh_stream *m = mainsrc->streams[i];
+        int num_main_streams = demux_get_num_stream(mainsrc);
+        for (int i = 0; i < num_main_streams; i++) {
+            struct sh_stream *m = demux_get_stream(mainsrc, i);
             if (m->attached_picture)
                 continue;
 
@@ -482,7 +489,7 @@ static void check_track_compatibility(struct timeline *tl)
             if (s) {
                 // There are actually many more things that in theory have to
                 // match (though mpv's implementation doesn't care).
-                if (s->codec && m->codec && strcmp(s->codec, m->codec) != 0)
+                if (strcmp(s->codec->codec, m->codec->codec) != 0)
                     MP_WARN(tl, "Timeline segments have mismatching codec.\n");
             } else {
                 MP_WARN(tl, "Source %s lacks %s stream with TID=%d, which "
@@ -502,19 +509,21 @@ void build_ordered_chapter_timeline(struct timeline *tl)
     if (!demuxer->matroska_data.ordered_chapters)
         return;
 
-    if (!demuxer->global->opts->ordered_chapters) {
-        MP_INFO(demuxer, "File uses ordered chapters, but "
-                "you have disabled support for them. Ignoring.\n");
-        return;
-    }
-
     struct tl_ctx *ctx = talloc_ptrtype(tl, ctx);
     *ctx = (struct tl_ctx){
         .log = tl->log,
         .global = tl->global,
         .tl = tl,
         .demuxer = demuxer,
+        .opts = mp_get_config_group(ctx, tl->global, NULL),
     };
+
+    if (!ctx->opts->ordered_chapters || !demuxer->access_references) {
+        MP_INFO(demuxer, "File uses ordered chapters, but "
+                "you have disabled support for them. Ignoring.\n");
+        talloc_free(ctx);
+        return;
+    }
 
     MP_INFO(ctx, "File uses ordered chapters, will build edit timeline.\n");
 
@@ -556,9 +565,6 @@ void build_ordered_chapter_timeline(struct timeline *tl)
 
     struct demux_chapter *chapters =
         talloc_zero_array(tl, struct demux_chapter, m->num_ordered_chapters);
-    // Stupid hack, because fuck everything.
-    for (int n = 0; n < m->num_ordered_chapters; n++)
-        chapters[n].pts = -1;
 
     ctx->timeline = talloc_array_ptrtype(tl, ctx->timeline, 0);
     ctx->num_chapters = m->num_ordered_chapters;
@@ -569,9 +575,9 @@ void build_ordered_chapter_timeline(struct timeline *tl)
     };
     build_timeline_loop(ctx, chapters, &info, 0);
 
-    // Fuck everything (2): filter out all "unset" chapters.
+    // Fuck everything: filter out all "unset" chapters.
     for (int n = m->num_ordered_chapters - 1; n >= 0; n--) {
-        if (chapters[n].pts == -1)
+        if (!chapters[n].metadata)
             MP_TARRAY_REMOVE_AT(chapters, m->num_ordered_chapters, n);
     }
 

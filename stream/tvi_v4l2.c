@@ -55,7 +55,6 @@ known issues:
 #endif
 #include "common/msg.h"
 #include "common/common.h"
-#include "video/img_fourcc.h"
 #include "audio/format.h"
 #include "tv.h"
 #include "audio_in.h"
@@ -73,7 +72,11 @@ known issues:
 #define V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC 0x2000
 #endif
 
-#define HAVE_CLOCK_GETTIME (defined(_POSIX_TIMERS) && _POSIX_TIMERS > 0)
+#if defined(_POSIX_TIMERS) && _POSIX_TIMERS > 0
+#define HAVE_CLOCK_GETTIME 1
+#else
+#define HAVE_CLOCK_GETTIME 0
+#endif
 
 #define info tvi_info_v4l2
 static tvi_handle_t *tvi_init_v4l2(struct mp_log *log, tv_param_t* tv_param);
@@ -232,7 +235,8 @@ static int fcc_mp2vl(int fcc)
     case MP_FOURCC_YUY2:   return V4L2_PIX_FMT_YUYV;
     case MP_FOURCC_YV12:   return V4L2_PIX_FMT_YVU420;
     case MP_FOURCC_UYVY:   return V4L2_PIX_FMT_UYVY;
-    case MP_FOURCC_MJPEG:   return V4L2_PIX_FMT_MJPEG;
+    case MP_FOURCC_MJPEG:  return V4L2_PIX_FMT_MJPEG;
+    case MP_FOURCC_JPEG:   return V4L2_PIX_FMT_JPEG;
     }
     return fcc;
 }
@@ -256,7 +260,8 @@ static int fcc_vl2mp(int fcc)
     case V4L2_PIX_FMT_YVU420:   return MP_FOURCC_YV12;
     case V4L2_PIX_FMT_YUYV:     return MP_FOURCC_YUY2;
     case V4L2_PIX_FMT_UYVY:     return MP_FOURCC_UYVY;
-    case V4L2_PIX_FMT_MJPEG:     return MP_FOURCC_MJPEG;
+    case V4L2_PIX_FMT_MJPEG:    return MP_FOURCC_MJPEG;
+    case V4L2_PIX_FMT_JPEG:     return MP_FOURCC_JPEG;
     }
     return fcc;
 }
@@ -295,6 +300,7 @@ static const char *pixfmt2name(char *buf, int pixfmt)
     case V4L2_PIX_FMT_HI240:        return "HI240";
     case V4L2_PIX_FMT_WNVA:         return "WNVA";
     case V4L2_PIX_FMT_MJPEG:        return "MJPEG";
+    case V4L2_PIX_FMT_JPEG:         return "JPEG";
     }
     sprintf(buf, "unknown (0x%x)", pixfmt);
     return buf;
@@ -1003,10 +1009,15 @@ static int uninit(priv_t *priv)
     set_mute(priv, 1);
 
     /* free memory and close device */
-    free(priv->map);                priv->map = NULL;
+    free(priv->map);
+    priv->map = NULL;
     priv->mapcount = 0;
-    if(priv->video_fd!=-1)v4l2_close(priv->video_fd);        priv->video_fd  = -1;
-    free(priv->video_dev);        priv->video_dev = NULL;
+    if (priv->video_fd != -1) {
+        v4l2_close(priv->video_fd);
+        priv->video_fd = -1;
+    }
+    free(priv->video_dev);
+    priv->video_dev = NULL;
 
     if (priv->video_ringbuffer) {
         for (int n = 0; n < priv->video_buffer_size_current; n++) {
@@ -1352,7 +1363,7 @@ static int start(priv_t *priv)
         if (priv->map[i].buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
             MP_WARN(priv, "compiled without clock_gettime() that is needed to handle monotone video timestamps from the kernel. Expect desync.\n");
 #endif
-        /* count up to make sure this is correct everytime */
+        /* count up to make sure this is correct every time */
         priv->mapcount++;
 
         if (v4l2_ioctl(priv->video_fd, VIDIOC_QBUF, &(priv->map[i].buf)) < 0) {

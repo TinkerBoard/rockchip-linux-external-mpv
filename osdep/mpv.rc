@@ -1,52 +1,48 @@
 /*
- * Windows resource file for mpv
- *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <winver.h>
 #include "version.h"
 
-1 VERSIONINFO
-FILEVERSION 2,0,0,0
-PRODUCTVERSION 2,0,0,0
-FILEOS VOS__WINDOWS32
-FILETYPE VFT_APP
-{
-    BLOCK "StringFileInfo"
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION 2, 0, 0, 0
+    PRODUCTVERSION 2, 0, 0, 0
+    FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+    FILEFLAGS 0
+    FILEOS VOS__WINDOWS32
+    FILETYPE VFT_APP
+    FILESUBTYPE 0
     {
-        BLOCK "000004b0" // LANG_NEUTRAL,UNICODE_CP
-        {
-            VALUE "Comments","mpv is distributed under the terms of the GNU General Public License Version 2 or later.\000"
-            VALUE "CompanyName", "mpv\000"
-            VALUE "FileDescription", "mpv\000"
-            VALUE "FileVersion",VERSION
-            VALUE "LegalCopyright", " (C) 2000-2015 mpv/mplayer2/MPlayer\000"
-            //VALUE "LegalTrademarks"," \000";
-            VALUE "OriginalFilename", "mpv.exe\000"
-            VALUE "ProductName", "mpv\000"
-            VALUE "ProductVersion",VERSION
-            //VALUE "SpecialBuild","\000"
+        BLOCK "StringFileInfo" {
+            BLOCK "000004b0" {
+                VALUE "Comments", "mpv is distributed under the terms of the GNU General Public License Version 2 or later."
+                VALUE "CompanyName", "mpv"
+                VALUE "FileDescription", "mpv"
+                VALUE "FileVersion", VERSION
+                VALUE "LegalCopyright", MPVCOPYRIGHT
+                VALUE "OriginalFilename", "mpv.exe"
+                VALUE "ProductName", "mpv"
+                VALUE "ProductVersion", VERSION
+            }
+        }
+        BLOCK "VarFileInfo" {
+            VALUE "Translation", 0, 1200
         }
     }
-    BLOCK "VarFileInfo"
-    {
-        VALUE "Translation",0,0x04b0
-    }
-}
 
 IDI_ICON1 ICON DISCARDABLE  "etc/mpv-icon.ico"
 

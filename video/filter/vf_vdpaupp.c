@@ -1,20 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * Parts based on fragments of vo_vdpau.c: Copyright (C) 2009 Uoti Urpala
- *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdio.h>
@@ -23,218 +21,152 @@
 #include <inttypes.h>
 #include <assert.h>
 
+#include <libavutil/hwcontext.h>
+
 #include "common/common.h"
 #include "common/msg.h"
 #include "options/m_option.h"
-
+#include "filters/filter.h"
+#include "filters/filter_internal.h"
+#include "filters/user_filters.h"
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/hwdec.h"
 #include "video/vdpau.h"
 #include "video/vdpau_mixer.h"
-#include "vf.h"
+#include "refqueue.h"
 
 // Note: this filter does no actual filtering; it merely sets appropriate
 //       flags on vdpau images (mp_vdpau_mixer_frame) to do the appropriate
 //       processing on the final rendering process in the VO.
 
-struct vf_priv_s {
-    struct mp_vdpau_ctx *ctx;
-
-    // This is needed to supply past/future fields and to calculate the
-    // interpolated timestamp.
-    struct mp_image *buffered[3];
-    int num_buffered;
-
-    int prev_pos;           // last field that was output
-
-    int def_deintmode;
+struct opts {
     int deint_enabled;
+    int interlaced_only;
     struct mp_vdpau_mixer_opts opts;
 };
 
-static void forget_frames(struct vf_instance *vf)
-{
-    struct vf_priv_s *p = vf->priv;
-    for (int n = 0; n < p->num_buffered; n++)
-        talloc_free(p->buffered[n]);
-    p->num_buffered = 0;
-    p->prev_pos = 0;
-}
+struct priv {
+    struct opts *opts;
+    struct mp_vdpau_ctx *ctx;
+    struct mp_refqueue *queue;
+    struct mp_pin *in_pin;
+};
 
-#define FIELD_VALID(p, f) ((f) >= 0 && (f) < (p)->num_buffered * 2)
-
-static VdpVideoSurface ref_field(struct vf_priv_s *p,
+static VdpVideoSurface ref_field(struct priv *p,
                                  struct mp_vdpau_mixer_frame *frame, int pos)
 {
-    if (!FIELD_VALID(p, pos))
-        return VDP_INVALID_HANDLE;
-    struct mp_image *mpi = mp_image_new_ref(p->buffered[pos / 2]);
+    struct mp_image *mpi = mp_image_new_ref(mp_refqueue_get_field(p->queue, pos));
     if (!mpi)
         return VDP_INVALID_HANDLE;
     talloc_steal(frame, mpi);
     return (uintptr_t)mpi->planes[3];
 }
 
-// pos==0 means last field of latest frame, 1 earlier field of latest frame,
-// 2 last field of previous frame and so on
-static bool output_field(struct vf_instance *vf, int pos)
+static void vf_vdpaupp_process(struct mp_filter *f)
 {
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = f->priv;
 
-    if (!FIELD_VALID(p, pos))
-        return false;
+    mp_refqueue_execute_reinit(p->queue);
 
-    struct mp_image *mpi = mp_vdpau_mixed_frame_create(p->buffered[pos / 2]);
+    if (!mp_refqueue_can_output(p->queue))
+        return;
+
+    struct mp_image *mpi =
+        mp_vdpau_mixed_frame_create(mp_refqueue_get_field(p->queue, 0));
     if (!mpi)
-        return false; // skip output on OOM
+        return; // OOM
     struct mp_vdpau_mixer_frame *frame = mp_vdpau_mixed_frame_get(mpi);
 
-    frame->field = VDP_VIDEO_MIXER_PICTURE_STRUCTURE_FRAME;
-    if (p->opts.deint) {
-        int top_field_first = !!(mpi->fields & MP_IMGFIELD_TOP_FIRST);
-        frame->field = top_field_first ^ (pos & 1) ?
-            VDP_VIDEO_MIXER_PICTURE_STRUCTURE_BOTTOM_FIELD:
-            VDP_VIDEO_MIXER_PICTURE_STRUCTURE_TOP_FIELD;
+    if (!mp_refqueue_should_deint(p->queue)) {
+        frame->field = VDP_VIDEO_MIXER_PICTURE_STRUCTURE_FRAME;
+    } else if (mp_refqueue_is_top_field(p->queue)) {
+        frame->field = VDP_VIDEO_MIXER_PICTURE_STRUCTURE_TOP_FIELD;
+    } else {
+        frame->field = VDP_VIDEO_MIXER_PICTURE_STRUCTURE_BOTTOM_FIELD;
     }
 
-    frame->future[0] = ref_field(p, frame, pos - 1);
-    frame->current = ref_field(p, frame, pos);
-    frame->past[0] = ref_field(p, frame, pos + 1);
-    frame->past[1] = ref_field(p, frame, pos + 2);
+    frame->future[0] = ref_field(p, frame, 1);
+    frame->current = ref_field(p, frame, 0);
+    frame->past[0] = ref_field(p, frame, -1);
+    frame->past[1] = ref_field(p, frame, -2);
 
-    frame->opts = p->opts;
+    frame->opts = p->opts->opts;
 
     mpi->planes[3] = (void *)(uintptr_t)frame->current;
 
-    // Interpolate timestamps of extra fields (these always have even indexes)
-    int idx = pos / 2;
-    if (idx > 0 && !(pos & 1) && p->opts.deint >= 2) {
-        double pts1 = p->buffered[idx - 1]->pts;
-        double pts2 = p->buffered[idx]->pts;
-        double diff = pts1 - pts2;
-        mpi->pts = diff > 0 && diff < 0.5 ? (pts1 + pts2) / 2 : pts2;
+    mpi->params.hw_subfmt = 0; // force mixer
+
+    mp_refqueue_write_out_pin(p->queue, mpi);
+}
+
+static void vf_vdpaupp_reset(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    mp_refqueue_flush(p->queue);
+}
+
+static void vf_vdpaupp_destroy(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    talloc_free(p->queue);
+}
+
+static const struct mp_filter_info vf_vdpaupp_filter = {
+    .name = "vdpaupp",
+    .process = vf_vdpaupp_process,
+    .reset = vf_vdpaupp_reset,
+    .destroy = vf_vdpaupp_destroy,
+    .priv_size = sizeof(struct priv),
+};
+
+static struct mp_filter *vf_vdpaupp_create(struct mp_filter *parent, void *options)
+{
+    struct mp_filter *f = mp_filter_create(parent, &vf_vdpaupp_filter);
+    if (!f) {
+        talloc_free(options);
+        return NULL;
     }
 
-    vf_add_output_frame(vf, mpi);
-    return true;
-}
+    mp_filter_add_pin(f, MP_PIN_IN, "in");
+    mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
-static int filter_ext(struct vf_instance *vf, struct mp_image *mpi)
-{
-    struct vf_priv_s *p = vf->priv;
-    int maxbuffer = p->opts.deint >= 2 ? 3 : 2;
-    bool eof = !mpi;
+    struct priv *p = f->priv;
+    p->opts = talloc_steal(p, options);
 
-    if (mpi) {
-        struct mp_image *new = mp_vdpau_upload_video_surface(p->ctx, mpi);
-        talloc_free(mpi);
-        if (!new)
-            return -1;
-        mpi = new;
+    p->queue = mp_refqueue_alloc(f);
 
-        if (mp_vdpau_mixed_frame_get(mpi)) {
-            MP_ERR(vf, "Can't apply vdpaupp filter multiple times.\n");
-            vf_add_output_frame(vf, mpi);
-            return -1;
-        }
-
-        while (p->num_buffered >= maxbuffer) {
-            talloc_free(p->buffered[p->num_buffered - 1]);
-            p->num_buffered--;
-        }
-        for (int n = p->num_buffered; n > 0; n--)
-            p->buffered[n] = p->buffered[n - 1];
-        p->buffered[0] = mpi;
-        p->num_buffered++;
-        p->prev_pos += 2;
-    }
-
-    while (1) {
-        int current = p->prev_pos - 1;
-        if (!FIELD_VALID(p, current))
-            break;
-        // No field-splitting deinterlace -> only output first field (odd index)
-        if ((current & 1) || p->opts.deint >= 2) {
-            // Wait for enough future frames being buffered.
-            // (Past frames are always around if available at all.)
-            if (!eof && !FIELD_VALID(p, current - 1))
-                break;
-            if (!output_field(vf, current))
-                break;
-        }
-        p->prev_pos = current;
-    }
-
-    return 0;
-}
-
-static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
-                    struct mp_image_params *out)
-{
-    forget_frames(vf);
-    *out = *in;
-    out->imgfmt = IMGFMT_VDPAU;
-    return 0;
-}
-
-static int query_format(struct vf_instance *vf, unsigned int fmt)
-{
-    if (fmt == IMGFMT_VDPAU || mp_vdpau_get_format(fmt, NULL, NULL))
-        return vf_next_query_format(vf, IMGFMT_VDPAU);
-    return 0;
-}
-
-static int control(vf_instance_t *vf, int request, void *data)
-{
-    struct vf_priv_s *p = vf->priv;
-
-    switch (request) {
-    case VFCTRL_SEEK_RESET:
-        forget_frames(vf);
-        return CONTROL_OK;
-    case VFCTRL_GET_DEINTERLACE:
-        *(int *)data = !!p->deint_enabled;
-        return true;
-    case VFCTRL_SET_DEINTERLACE:
-        p->deint_enabled = !!*(int *)data;
-        p->opts.deint = p->deint_enabled ? p->def_deintmode : 0;
-        return true;
-    }
-    return CONTROL_UNKNOWN;
-}
-
-static void uninit(struct vf_instance *vf)
-{
-    forget_frames(vf);
-}
-
-static int vf_open(vf_instance_t *vf)
-{
-    struct vf_priv_s *p = vf->priv;
-
-    vf->reconfig = reconfig;
-    vf->filter_ext = filter_ext;
-    vf->filter = NULL;
-    vf->query_format = query_format;
-    vf->control = control;
-    vf->uninit = uninit;
-
-    if (!vf->hwdec)
-        return 0;
-    hwdec_request_api(vf->hwdec, "vdpau");
-    p->ctx = vf->hwdec->hwctx ? vf->hwdec->hwctx->vdpau_ctx : NULL;
+    AVBufferRef *ref = mp_filter_load_hwdec_device(f, AV_HWDEVICE_TYPE_VDPAU);
+    if (!ref)
+        goto error;
+    p->ctx = mp_vdpau_get_ctx_from_av(ref);
+    av_buffer_unref(&ref);
     if (!p->ctx)
-        return 0;
+        goto error;
 
-    p->def_deintmode = p->opts.deint;
-    if (!p->deint_enabled)
-        p->opts.deint = 0;
+    if (!p->opts->deint_enabled)
+        p->opts->opts.deint = 0;
 
-    return 1;
+    if (p->opts->opts.deint >= 2) {
+        mp_refqueue_set_refs(p->queue, 1, 1); // 2 past fields, 1 future field
+    } else {
+        mp_refqueue_set_refs(p->queue, 0, 0);
+    }
+    mp_refqueue_set_mode(p->queue,
+        (p->opts->deint_enabled ? MP_MODE_DEINT : 0) |
+        (p->opts->interlaced_only ? MP_MODE_INTERLACED_ONLY : 0) |
+        (p->opts->opts.deint >= 2 ? MP_MODE_OUTPUT_FIELDS : 0));
+
+    mp_refqueue_add_in_format(p->queue, IMGFMT_VDPAU, 0);
+
+    return f;
+
+error:
+    talloc_free(f);
+    return NULL;
 }
 
-#define OPT_BASE_STRUCT struct vf_priv_s
+#define OPT_BASE_STRUCT struct opts
 static const m_option_t vf_opts_fields[] = {
     OPT_CHOICE("deint-mode", opts.deint, 0,
                ({"first-field", 1},
@@ -248,13 +180,16 @@ static const m_option_t vf_opts_fields[] = {
     OPT_FLOATRANGE("denoise", opts.denoise, 0, 0, 1),
     OPT_FLOATRANGE("sharpen", opts.sharpen, 0, -1, 1),
     OPT_INTRANGE("hqscaling", opts.hqscaling, 0, 0, 9),
+    OPT_FLAG("interlaced-only", interlaced_only, 0),
     {0}
 };
 
-const vf_info_t vf_info_vdpaupp = {
-    .description = "vdpau postprocessing",
-    .name = "vdpaupp",
-    .open = vf_open,
-    .priv_size = sizeof(struct vf_priv_s),
-    .options = vf_opts_fields,
+const struct mp_user_filter_entry vf_vdpaupp = {
+    .desc = {
+        .description = "vdpau postprocessing",
+        .name = "vdpaupp",
+        .priv_size = sizeof(OPT_BASE_STRUCT),
+        .options = vf_opts_fields,
+    },
+    .create = vf_vdpaupp_create,
 };

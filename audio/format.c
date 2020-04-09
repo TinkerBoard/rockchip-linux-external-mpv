@@ -3,66 +3,66 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <inttypes.h>
 #include <limits.h>
-#include <assert.h>
 
 #include "common/common.h"
-#include "audio/filter/af.h"
+#include "format.h"
 
-int af_fmt2bps(int format)
+// number of bytes per sample, 0 if invalid/unknown
+int af_fmt_to_bytes(int format)
 {
-    switch (format & AF_FORMAT_BITS_MASK) {
-    case AF_FORMAT_8BIT:  return 1;
-    case AF_FORMAT_16BIT: return 2;
-    case AF_FORMAT_24BIT: return 3;
-    case AF_FORMAT_32BIT: return 4;
-    case AF_FORMAT_64BIT: return 8;
+    switch (af_fmt_from_planar(format)) {
+    case AF_FORMAT_U8:      return 1;
+    case AF_FORMAT_S16:     return 2;
+    case AF_FORMAT_S32:     return 4;
+    case AF_FORMAT_FLOAT:   return 4;
+    case AF_FORMAT_DOUBLE:  return 8;
     }
+    if (af_fmt_is_spdif(format))
+        return 2;
     return 0;
 }
 
-int af_fmt2bits(int format)
+// All formats are considered signed, except explicitly unsigned int formats.
+bool af_fmt_is_unsigned(int format)
 {
-    return af_fmt2bps(format) * 8;
+    return format == AF_FORMAT_U8 || format == AF_FORMAT_U8P;
 }
 
-static int bits_to_mask(int bits)
+bool af_fmt_is_float(int format)
 {
-    switch (bits) {
-    case 8:  return AF_FORMAT_8BIT;
-    case 16: return AF_FORMAT_16BIT;
-    case 24: return AF_FORMAT_24BIT;
-    case 32: return AF_FORMAT_32BIT;
-    case 64: return AF_FORMAT_64BIT;
-    }
-    return 0;
+    format = af_fmt_from_planar(format);
+    return format == AF_FORMAT_FLOAT || format == AF_FORMAT_DOUBLE;
 }
 
-int af_fmt_change_bits(int format, int bits)
+// true for both unsigned and signed ints
+bool af_fmt_is_int(int format)
 {
-    if (!af_fmt_is_valid(format))
-        return 0;
-    int mask = bits_to_mask(bits);
-    format = (format & ~AF_FORMAT_BITS_MASK) | mask;
-    return af_fmt_is_valid(format) ? format : 0;
+    return format && !af_fmt_is_spdif(format) && !af_fmt_is_float(format);
+}
+
+bool af_fmt_is_spdif(int format)
+{
+    return af_format_sample_alignment(format) > 1;
+}
+
+bool af_fmt_is_pcm(int format)
+{
+    return af_fmt_is_valid(format) && !af_fmt_is_spdif(format);
 }
 
 static const int planar_formats[][2] = {
@@ -73,23 +73,30 @@ static const int planar_formats[][2] = {
     {AF_FORMAT_DOUBLEP, AF_FORMAT_DOUBLE},
 };
 
+bool af_fmt_is_planar(int format)
+{
+    for (int n = 0; n < MP_ARRAY_SIZE(planar_formats); n++) {
+        if (planar_formats[n][0] == format)
+            return true;
+    }
+    return false;
+}
+
 // Return the planar format corresponding to the given format.
-// If the format is already planar, return it.
-// Return 0 if there's no equivalent.
+// If the format is already planar or if there's no equivalent,
+// return it.
 int af_fmt_to_planar(int format)
 {
     for (int n = 0; n < MP_ARRAY_SIZE(planar_formats); n++) {
         if (planar_formats[n][1] == format)
             return planar_formats[n][0];
-        if (planar_formats[n][0] == format)
-            return format;
     }
-    return 0;
+    return format;
 }
 
 // Return the interleaved format corresponding to the given format.
-// If the format is already interleaved, return it.
-// Always succeeds if format is actually planar; otherwise return 0.
+// If the format is already interleaved or if there's no equivalent,
+// return it.
 int af_fmt_from_planar(int format)
 {
     for (int n = 0; n < MP_ARRAY_SIZE(planar_formats); n++) {
@@ -99,81 +106,39 @@ int af_fmt_from_planar(int format)
     return format;
 }
 
-const struct af_fmt_entry af_fmtstr_table[] = {
-    {"u8",          AF_FORMAT_U8},
-    {"s8",          AF_FORMAT_S8},
-    {"u16",         AF_FORMAT_U16},
-    {"s16",         AF_FORMAT_S16},
-    {"u24",         AF_FORMAT_U24},
-    {"s24",         AF_FORMAT_S24},
-    {"u32",         AF_FORMAT_U32},
-    {"s32",         AF_FORMAT_S32},
-    {"float",       AF_FORMAT_FLOAT},
-    {"double",      AF_FORMAT_DOUBLE},
-
-    {"u8p",         AF_FORMAT_U8P},
-    {"s16p",        AF_FORMAT_S16P},
-    {"s32p",        AF_FORMAT_S32P},
-    {"floatp",      AF_FORMAT_FLOATP},
-    {"doublep",     AF_FORMAT_DOUBLEP},
-
-    {"spdif-aac",   AF_FORMAT_S_AAC},
-    {"spdif-ac3",   AF_FORMAT_S_AC3},
-    {"spdif-dts",   AF_FORMAT_S_DTS},
-    {"spdif-dtshd", AF_FORMAT_S_DTSHD},
-    {"spdif-eac3",  AF_FORMAT_S_EAC3},
-    {"spdif-mp3",   AF_FORMAT_S_MP3},
-    {"spdif-truehd",AF_FORMAT_S_TRUEHD},
-
-    {0}
-};
-
 bool af_fmt_is_valid(int format)
 {
-    for (int i = 0; af_fmtstr_table[i].name; i++) {
-        if (af_fmtstr_table[i].format == format)
-            return true;
-    }
-    return false;
+    return format > 0 && format < AF_FORMAT_COUNT;
 }
 
 const char *af_fmt_to_str(int format)
 {
-    for (int i = 0; af_fmtstr_table[i].name; i++) {
-        if (af_fmtstr_table[i].format == format)
-            return af_fmtstr_table[i].name;
+    switch (format) {
+    case AF_FORMAT_U8:          return "u8";
+    case AF_FORMAT_S16:         return "s16";
+    case AF_FORMAT_S32:         return "s32";
+    case AF_FORMAT_FLOAT:       return "float";
+    case AF_FORMAT_DOUBLE:      return "double";
+    case AF_FORMAT_U8P:         return "u8p";
+    case AF_FORMAT_S16P:        return "s16p";
+    case AF_FORMAT_S32P:        return "s32p";
+    case AF_FORMAT_FLOATP:      return "floatp";
+    case AF_FORMAT_DOUBLEP:     return "doublep";
+    case AF_FORMAT_S_AAC:       return "spdif-aac";
+    case AF_FORMAT_S_AC3:       return "spdif-ac3";
+    case AF_FORMAT_S_DTS:       return "spdif-dts";
+    case AF_FORMAT_S_DTSHD:     return "spdif-dtshd";
+    case AF_FORMAT_S_EAC3:      return "spdif-eac3";
+    case AF_FORMAT_S_MP3:       return "spdif-mp3";
+    case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
     }
-
     return "??";
-}
-
-int af_fmt_seconds_to_bytes(int format, float seconds, int channels, int samplerate)
-{
-    assert(!AF_FORMAT_IS_PLANAR(format));
-    int bps      = af_fmt2bps(format);
-    int framelen = channels * bps;
-    int bytes    = seconds  * bps * samplerate;
-    if (bytes % framelen)
-        bytes += framelen - (bytes % framelen);
-    return bytes;
-}
-
-int af_str2fmt_short(bstr str)
-{
-    for (int i = 0; af_fmtstr_table[i].name; i++) {
-        if (!bstrcasecmp0(str, af_fmtstr_table[i].name))
-            return af_fmtstr_table[i].format;
-    }
-    return 0;
 }
 
 void af_fill_silence(void *dst, size_t bytes, int format)
 {
-    bool us = (format & AF_FORMAT_SIGN_MASK) == AF_FORMAT_US;
-    memset(dst, us ? 0x80 : 0, bytes);
+    memset(dst, af_fmt_is_unsigned(format) ? 0x80 : 0, bytes);
 }
-
-#define FMT_DIFF(type, a, b) (((a) & type) - ((b) & type))
 
 // Returns a "score" that serves as heuristic how lossy or hard a conversion is.
 // If the formats are equal, 1024 is returned. If they are gravely incompatible
@@ -186,34 +151,99 @@ int af_format_conversion_score(int dst_format, int src_format)
     if (dst_format == src_format)
         return 1024;
     // Can't be normally converted
-    if (AF_FORMAT_IS_SPECIAL(dst_format) || AF_FORMAT_IS_SPECIAL(src_format))
+    if (!af_fmt_is_pcm(dst_format) || !af_fmt_is_pcm(src_format))
         return INT_MIN;
     int score = 1024;
-    if (FMT_DIFF(AF_FORMAT_INTERLEAVING_MASK, dst_format, src_format))
+    if (af_fmt_is_planar(dst_format) != af_fmt_is_planar(src_format))
         score -= 1;     // has to (de-)planarize
-    if (FMT_DIFF(AF_FORMAT_SIGN_MASK, dst_format, src_format))
-        score -= 4;     // has to swap sign
-    if (FMT_DIFF(AF_FORMAT_TYPE_MASK, dst_format, src_format)) {
-        int dst_bits = dst_format & AF_FORMAT_BITS_MASK;
-        if ((dst_format & AF_FORMAT_TYPE_MASK) == AF_FORMAT_F) {
-            // For int->float, always prefer 32 bit float.
-            score -= dst_bits == AF_FORMAT_32BIT ? 8 : 0;
+    if (af_fmt_is_float(dst_format) != af_fmt_is_float(src_format)) {
+        int dst_bytes = af_fmt_to_bytes(dst_format);
+        if (af_fmt_is_float(dst_format)) {
+            // For int->float, consider a lower bound on the precision difference.
+            int bytes = (dst_bytes == 4 ? 3 : 6) - af_fmt_to_bytes(src_format);
+            if (bytes >= 0) {
+                score -= 8 * bytes;          // excess precision
+            } else {
+                score += 1024 * (bytes - 1); // precision is lost (i.e. s32 -> float)
+            }
         } else {
-            // For float->int, always prefer highest bit depth int
-            score -= 8 * (AF_FORMAT_64BIT - dst_bits);
+            // float->int is the worst case. Penalize heavily and
+            // prefer highest bit depth int.
+            score -= 1048576 * (8 - dst_bytes);
         }
+        score -= 512; // penalty for any float <-> int conversion
     } else {
-        int bits = FMT_DIFF(AF_FORMAT_BITS_MASK, dst_format, src_format);
-        if (bits > 0) {
-            score -= 8 * bits;          // has to add padding
-        } else if (bits < 0) {
-            score -= 1024 - 8 * bits;   // has to reduce bit depth
+        int bytes = af_fmt_to_bytes(dst_format) - af_fmt_to_bytes(src_format);
+        if (bytes > 0) {
+            score -= 8 * bytes;          // has to add padding
+        } else if (bytes < 0) {
+            score += 1024 * (bytes - 1); // has to reduce bit depth
         }
     }
-    // Consider this the worst case.
-    if (FMT_DIFF(AF_FORMAT_TYPE_MASK, dst_format, src_format))
-        score -= 2048;  // has to convert float<->int
     return score;
+}
+
+struct entry {
+    int fmt;
+    int score;
+};
+
+static int cmp_entry(const void *a, const void *b)
+{
+#define CMP_INT(a, b) (a > b ? 1 : (a < b ? -1 : 0))
+    return -CMP_INT(((struct entry *)a)->score, ((struct entry *)b)->score);
+}
+
+// Return a list of sample format compatible to src_format, sorted by order
+// of preference. out_formats[0] will be src_format (as long as it's valid),
+// and the list is terminated with 0 (AF_FORMAT_UNKNOWN).
+// Keep in mind that this also returns formats with flipped interleaving
+// (e.g. for s16, it returns [s16, s16p, ...]).
+// out_formats must be an int[AF_FORMAT_COUNT + 1] array.
+void af_get_best_sample_formats(int src_format, int *out_formats)
+{
+    int num = 0;
+    struct entry e[AF_FORMAT_COUNT + 1];
+    for (int fmt = 1; fmt < AF_FORMAT_COUNT; fmt++) {
+        int score = af_format_conversion_score(fmt, src_format);
+        if (score > INT_MIN)
+            e[num++] = (struct entry){fmt, score};
+    }
+    qsort(e, num, sizeof(e[0]), cmp_entry);
+    for (int n = 0; n < num; n++)
+        out_formats[n] = e[n].fmt;
+    out_formats[num] = 0;
+}
+
+// Return the best match to src_samplerate from the list provided in the array
+// *available, which must be terminated by 0, or itself NULL. If *available is
+// empty or NULL, return a negative value. Exact match to src_samplerate is
+// most preferred, followed by the lowest integer multiple, followed by the
+// maximum of *available.
+int af_select_best_samplerate(int src_samplerate, const int *available)
+{
+    if (!available)
+        return -1;
+
+    int min_mult_rate = INT_MAX;
+    int max_rate      = INT_MIN;
+    for (int i = 0; available[i]; i++) {
+        if (available[i] == src_samplerate)
+            return available[i];
+
+        if (!(available[i] % src_samplerate))
+            min_mult_rate = MPMIN(min_mult_rate, available[i]);
+
+        max_rate = MPMAX(max_rate, available[i]);
+    }
+
+    if (min_mult_rate < INT_MAX)
+        return min_mult_rate;
+
+    if (max_rate > INT_MIN)
+        return max_rate;
+
+    return -1;
 }
 
 // Return the number of samples that make up one frame in this format.

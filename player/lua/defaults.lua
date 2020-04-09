@@ -24,8 +24,26 @@ function mp.get_opt(key, def)
     return val
 end
 
--- For dispatching script_binding. This is sent as:
---      script_message_to $script_name $binding_name $keystate
+function mp.input_define_section(section, contents, flags)
+    if flags == nil or flags == "" then
+        flags = "default"
+    end
+    mp.commandv("define-section", section, contents, flags)
+end
+
+function mp.input_enable_section(section, flags)
+    if flags == nil then
+        flags = ""
+    end
+    mp.commandv("enable-section", section, flags)
+end
+
+function mp.input_disable_section(section)
+    mp.commandv("disable-section", section)
+end
+
+-- For dispatching script-binding. This is sent as:
+--      script-message-to $script_name $binding_name $keystate
 -- The array is indexed by $binding_name, and has functions like this as value:
 --      fn($binding_name, $keystate)
 local dispatch_key_bindings = {}
@@ -89,7 +107,7 @@ function mp.set_key_bindings(list, section, flags)
                     cb()
                 end
             end
-            cfg = cfg .. key .. " script_binding " ..
+            cfg = cfg .. key .. " script-binding " ..
                   mp.script_name .. "/" .. mangle .. "\n"
         else
             cfg = cfg .. key .. " " .. cb .. "\n"
@@ -127,13 +145,13 @@ local function update_key_bindings()
         end
         local cfg = ""
         for k, v in pairs(key_bindings) do
-            if v.forced ~= def then
+            if v.bind and v.forced ~= def then
                 cfg = cfg .. v.bind .. "\n"
             end
         end
         mp.input_define_section(section, cfg, flags)
         -- TODO: remove the section if the script is stopped
-        mp.input_enable_section(section, "allow-hide-cursor|allow-vo-dragging")
+        mp.input_enable_section(section, "allow-hide-cursor+allow-vo-dragging")
     end
 end
 
@@ -143,7 +161,6 @@ local function add_binding(attrs, key, name, fn, rp)
         fn = name
         name = reserve_binding()
     end
-    local bind = key
     local repeatable = rp == "repeatable" or rp["repeatable"]
     if rp["forced"] then
         attrs.forced = true
@@ -187,7 +204,9 @@ local function add_binding(attrs, key, name, fn, rp)
         end
         msg_cb = fn
     end
-    attrs.bind = bind .. " script_binding " .. mp.script_name .. "/" .. name
+    if key and #key > 0 then
+        attrs.bind = key .. " script-binding " .. mp.script_name .. "/" .. name
+    end
     attrs.name = name
     key_bindings[name] = attrs
     update_key_bindings()
@@ -254,6 +273,10 @@ function timer_mt.resume(t)
         t.next_deadline = mp.get_time() + timeout
         timers[t] = t
     end
+end
+
+function timer_mt.is_enabled(t)
+    return timers[t] ~= nil
 end
 
 -- Return the timer that expires next.
@@ -389,7 +412,24 @@ mp.register_event("shutdown", function() mp.keep_running = false end)
 mp.register_event("client-message", message_dispatch)
 mp.register_event("property-change", property_change)
 
--- sent by "script_binding"
+-- called before the event loop goes back to sleep
+local idle_handlers = {}
+
+function mp.register_idle(cb)
+    idle_handlers[#idle_handlers + 1] = cb
+end
+
+function mp.unregister_idle(cb)
+    local new = {}
+    for _, handler in ipairs(idle_handlers) do
+        if handler ~= cb then
+            new[#new + 1] = handler
+        end
+    end
+    idle_handlers = new
+end
+
+-- sent by "script-binding"
 mp.register_script_message("key-binding", dispatch_key_binding)
 
 mp.msg = {
@@ -400,6 +440,7 @@ mp.msg = {
     info = function(...) return mp.log("info", ...) end,
     verbose = function(...) return mp.log("v", ...) end,
     debug = function(...) return mp.log("debug", ...) end,
+    trace = function(...) return mp.log("trace", ...) end,
 }
 
 _G.print = mp.msg.info
@@ -420,38 +461,40 @@ local function call_event_handlers(e)
     end
 end
 
-mp.use_suspend = true
+mp.use_suspend = false
+
+local suspend_warned = false
 
 function mp.dispatch_events(allow_wait)
     local more_events = true
     if mp.use_suspend then
-        mp.suspend()
+        if not suspend_warned then
+            mp.msg.error("mp.use_suspend is now ignored.")
+            suspend_warned = true
+        end
     end
     while mp.keep_running do
-        local wait = process_timers()
-        if wait == nil then
-            wait = 1e20 -- infinity for all practical purposes
-        end
-        if more_events or wait < 0 then
-            wait = 0
-        end
-        -- Resume playloop - important especially if an error happened while
-        -- suspended, and the error was handled, but no resume was done.
-        if wait > 0 then
+        local wait = 0
+        if not more_events then
+            wait = process_timers()
+            if wait == nil then
+                for _, handler in ipairs(idle_handlers) do
+                    handler()
+                end
+                wait = 1e20 -- infinity for all practical purposes
+            end
+            -- Resume playloop - important especially if an error happened while
+            -- suspended, and the error was handled, but no resume was done.
             mp.resume_all()
             if allow_wait ~= true then
                 return
             end
         end
         local e = mp.wait_event(wait)
-        -- Empty the event queue while suspended; otherwise, each
-        -- event will keep us waiting until the core suspends again.
-        if mp.use_suspend then
-            mp.suspend()
-        end
-        more_events = (e.event ~= "none")
-        if more_events then
+        more_events = false
+        if e.event ~= "none" then
             call_event_handlers(e)
+            more_events = true
         end
     end
 end
@@ -464,28 +507,25 @@ function mp.osd_message(text, duration)
     else
         duration = tostring(math.floor(duration * 1000))
     end
-    mp.commandv("show_text", text, duration)
+    mp.commandv("show-text", text, duration)
 end
 
 local hook_table = {}
-local hook_registered = false
 
-local function hook_run(id, cont)
-    local fn = hook_table[tonumber(id)]
+mp.register_event("hook", function(ev)
+    local fn = hook_table[tonumber(ev.id)]
     if fn then
         fn()
     end
-    mp.commandv("hook_ack", cont)
-end
+    mp.raw_hook_continue(ev.hook_id)
+end)
 
 function mp.add_hook(name, pri, cb)
-    if not hook_registered then
-        mp.register_script_message("hook_run", hook_run)
-        hook_registered = true
-    end
     local id = #hook_table + 1
     hook_table[id] = cb
-    mp.commandv("hook_add", name, id, pri)
+    -- The C API suggests using 0 for a neutral priority, but lua.rst suggests
+    -- 50 (?), so whatever.
+    mp.raw_hook_add(id, name, pri - 50)
 end
 
 local mp_utils = package.loaded["mp.utils"]
@@ -544,6 +584,16 @@ end
 
 function mp_utils.getcwd()
     return mp.get_property("working-directory")
+end
+
+function mp_utils.format_bytes_humanized(b)
+    local d = {"Bytes", "KiB", "MiB", "GiB", "TiB", "PiB"}
+    local i = 1
+    while b >= 1024 do
+        b = b / 1024
+        i = i + 1
+    end
+    return string.format("%0.2f %s", b, d[i] and d[i] or "*1024^" .. (i-1))
 end
 
 return {}

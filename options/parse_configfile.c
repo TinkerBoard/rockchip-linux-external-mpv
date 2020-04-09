@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "config.h"
@@ -128,15 +128,11 @@ int m_config_parse(m_config_t *config, const char *location, bstr data,
         }
 
         int res;
-        if (profile) {
-            if (bstr_equals0(option, "profile-desc")) {
-                m_profile_set_desc(profile, value);
-                res = 0;
-            } else {
-                res = m_config_set_profile_option(config, profile, option, value);
-            }
+        if (bstr_equals0(option, "profile-desc")) {
+            m_profile_set_desc(profile, value);
+            res = 0;
         } else {
-            res = m_config_set_option_ext(config, option, value, flags);
+            res = m_config_set_profile_option(config, profile, option, value);
         }
         if (res < 0) {
             MP_ERR(config, "%s setting option %.*s='%.*s' failed.\n",
@@ -153,6 +149,9 @@ int m_config_parse(m_config_t *config, const char *location, bstr data,
             break;
         }
     }
+
+    if (config->recursion_depth == 0)
+        m_config_finish_default_profile(config, flags);
 
     talloc_free(tmp);
     return 1;

@@ -68,7 +68,7 @@ echo "MXE_TARGETS := i686-w64-mingw32.static" >> settings.mk
 # Build required packages. The following provide a minimum required to build
 # a reasonable mpv binary (though not an absolute minimum).
 
-make gcc ffmpeg libass jpeg pthreads lua
+make gcc ffmpeg libass jpeg lua
 
 # Add MXE binaries to $PATH
 export PATH=/opt/mxe/usr/bin/:$PATH
@@ -101,25 +101,27 @@ Installing MSYS2
 
 1. Download an installer from https://msys2.github.io/
 
-   It doesn't matter whether the i686 or the x86_64 version is used. Both can
-   build 32-bit and 64-bit binaries when running on a 64-bit version of Windows.
+   Both the i686 and the x86_64 version of MSYS2 can build 32-bit and 64-bit
+   mpv binaries when running on a 64-bit version of Windows, but the x86_64
+   version is preferred since the larger address space makes it less prone to
+   fork() errors.
 
-2. Add ``C:\msys64\mingw64\bin`` to your ``%PATH%``. mpv will depend on several
-   DLLs in this folder.
+2. Start a MinGW-w64 shell (``mingw64.exe``). **Note:** This is different from
+   the MSYS2 shell that is started from the final installation dialog. You must
+   close that shell and open a new one.
 
-3. Start a MinGW-w64 shell (``mingw64_shell.bat``). For a 32-bit build, use
-   ``mingw32_shell.bat``.
+   For a 32-bit build, use ``mingw32.exe``.
 
 Updating MSYS2
 --------------
 
-To prevent errors during post-install, ``msys2-runtime`` and ``pacman`` must be
-updated first.
+To prevent errors during post-install, the MSYS2 core runtime must be updated
+separately.
 
 ```bash
-# Check for updates to msys2-runtime and pacman. If there were updates, restart
-# MSYS2 before continuing.
-pacman -Sy --needed msys2-runtime pacman
+# Check for core updates. If instructed, close the shell window and reopen it
+# before continuing.
+pacman -Syu
 
 # Update everything else
 pacman -Su
@@ -130,83 +132,78 @@ Installing mpv dependencies
 
 ```bash
 # Install MSYS2 build dependencies and a MinGW-w64 compiler
-pacman -S git pkg-config python3 mingw-w64-x86_64-gcc
+pacman -S git python $MINGW_PACKAGE_PREFIX-{pkg-config,gcc}
 
-# Install the most important MinGW-w64 dependencies. libass, libbluray and
-# lcms2 are also pulled in as dependencies of ffmpeg.
-pacman -S mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-libjpeg-turbo mingw-w64-x86_64-lua
-
-# Install additional (optional) dependencies
-pacman -S mingw-w64-x86_64-libdvdnav mingw-w64-x86_64-mpg123 mingw-w64-x86_64-libguess
+# Install the most important MinGW-w64 dependencies. libass and lcms2 are also
+# pulled in as dependencies of ffmpeg.
+pacman -S $MINGW_PACKAGE_PREFIX-{ffmpeg,libjpeg-turbo,lua51,angleproject-git}
 ```
-
-For a 32-bit build, install ``mingw-w64-i686-*`` packages instead.
 
 Building mpv
 ------------
 
-Clone the latest mpv from git and install waf:
+Clone the latest mpv from git and install waf. **Note:** ``/usr/bin/python3``
+is invoked directly here, since an MSYS2 version of Python is required.
 
 ```bash
 git clone https://github.com/mpv-player/mpv.git && cd mpv
-./bootstrap.py
+/usr/bin/python3 bootstrap.py
 ```
 
 Finally, compile and install mpv. Binaries will be installed to
-``/mingw64/bin``.
+``/mingw64/bin`` or ``/mingw32/bin``.
 
 ```bash
-# For a 32-bit build, use --prefix=/mingw32 instead
-./waf configure CC=gcc --prefix=/mingw64
-./waf install
+/usr/bin/python3 waf configure CC=gcc.exe --check-c-compiler=gcc --prefix=$MSYSTEM_PREFIX
+/usr/bin/python3 waf install
 ```
 
 Or, compile and install both libmpv and mpv:
 
 ```bash
-./waf configure CC=gcc --enable-libmpv-shared --prefix=/mingw64
-./waf install
-
-# waf installs libmpv to the wrong directory, so fix it up
-mv -f /mingw64/bin/pkgconfig/mpv.pc /mingw64/lib/pkgconfig/
-mv -f /mingw64/bin/libmpv.dll.a /mingw64/lib/
-sed -i 's_/mingw64/bin_/mingw64/lib_' /mingw64/lib/pkgconfig/mpv.pc
-rmdir /mingw64/bin/pkgconfig
+/usr/bin/python3 waf configure CC=gcc.exe --check-c-compiler=gcc --enable-libmpv-shared --prefix=$MSYSTEM_PREFIX
+/usr/bin/python3 waf install
 ```
 
-Additional dependencies
-=======================
+Linking libmpv with MSVC programs
+---------------------------------
 
-pthreads
---------
-
-mpv will use a pthreads wrapper by default. Either pthreads-win32 or
-winpthreads should work. The latter is packaged with most MinGW-w64
-environments, including MSYS2, so it shouldn't be a problem. If you don't have
-a pthreads wrapper or you want to build mpv without one, configure with:
+You can build C++ programs in Visual Studio and link them with libmpv. To do
+this, you need a Visual Studio which supports ``stdint.h`` (recent ones do),
+and you need to create a import library for the mpv DLL:
 
 ```bash
-./waf configure --enable-win32-internal-pthreads
+lib /def:mpv.def /name:mpv-1.dll /out:mpv.lib /MACHINE:X64
 ```
 
-libwaio
--------
+The string in the ``/name:`` parameter must match the filename of the DLL (this
+is simply the filename the MSVC linker will use). The ``mpv.def`` can be
+retrieved from the mpv build directory, or can be produced by MingGW's
+gendef.exe helper from the mpv DLL.
 
-If you want to use ``--input-file``, you need libwaio. It's available from
-git://midipix.org/waio
+Static linking is not possible.
 
-To compile libwaio in MSYS2, run:
+Running mpv
+-----------
+
+If you want to run mpv from the MinGW-w64 shell, you will find the experience
+much more pleasant if you use the ``winpty`` utility
 
 ```bash
-git clone git://midipix.org/waio && cd waio
-
-# 32-bit build, run from mingw32_shell.bat
-./build-mingw-nt32 lib-static CC=gcc AR=ar
-cp -r include/waio /mingw32/include
-cp lib32/libwaio.a /mingw32/lib
-
-# 64-bit build, run from mingw64_shell.bat
-./build-mingw-nt64 lib-static CC=gcc AR=ar
-cp -r include/waio /mingw64/include
-cp lib64/libwaio.a /mingw64/lib
+pacman -S winpty
+winpty mpv.com ToS-4k-1920.mov
 ```
+
+If you want to move / copy ``mpv.exe`` and ``mpv.com`` to somewhere other than
+``/mingw64/bin/`` for use outside the MinGW-w64 shell, they will still depend on
+DLLs in that folder. The simplest solution is to add ``C:\msys64\mingw64\bin``
+to the windows system ``%PATH%``. Beware though that this can cause problems or
+confusion in Cygwin if that is also installed on the machine.
+
+Use of the ANGLE OpenGL backend requires a copy of the D3D compiler DLL that
+matches the version of the D3D SDK that ANGLE was built with
+(``d3dcompiler_43.dll`` in case of MinGW-built ANGLE) in the path or in the
+same folder as mpv. It must be of the same architecture (x86_64 / i686) as the
+mpv you compiled. You can find copies here:
+
+https://mpv.srsfckn.biz/d3dcompiler.7z

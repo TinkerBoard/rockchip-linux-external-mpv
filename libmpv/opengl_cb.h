@@ -1,4 +1,6 @@
-/* Permission to use, copy, modify, and/or distribute this software for any
+/* Copyright (C) 2017 the mpv developers
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
  *
@@ -11,41 +13,39 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/*
- * Note: the client API is licensed under ISC (see above) to ease
- * interoperability with other licenses. But keep in mind that the
- * mpv core is still mostly GPLv2+. It's up to lawyers to decide
- * whether applications using this API are affected by the GPL.
- * One argument against this is that proprietary applications
- * using mplayer in slave mode is apparently tolerated, and this
- * API is basically equivalent to slave mode.
- */
-
 #ifndef MPV_CLIENT_API_OPENGL_CB_H_
 #define MPV_CLIENT_API_OPENGL_CB_H_
 
 #include "client.h"
+
+#if !MPV_ENABLE_DEPRECATED
+#error "This header and all API provided by it is deprecated. Use render.h instead."
+#else
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * Warning: this API is not stable yet.
  *
  * Overview
  * --------
  *
+ * Warning: this API is deprecated. A very similar API is provided by render.h
+ * and render_gl.h. The deprecated API is emulated with the new API.
+ *
  * This API can be used to make mpv render into a foreign OpenGL context. It
- * can be used to handle video display. Be aware that using this API is not
- * required: you can embed the mpv window by setting the mpv "wid" option to
- * a native window handle (see "Embedding the video window" section in the
- * client.h header). In general, using the "wid" option is recommended over
- * the OpenGL API, because it's simpler and more flexible on the mpv side.
+ * can be used to handle video display.
  *
  * The renderer needs to be explicitly initialized with mpv_opengl_cb_init_gl(),
  * and then video can be drawn with mpv_opengl_cb_draw(). The user thread can
  * be notified by new frames with mpv_opengl_cb_set_update_callback().
+ *
+ * You can output and embed video without this API by setting the mpv "wid"
+ * option to a native window handle (see "Embedding the video window" section
+ * in the client.h header). In general, using the opengl-cb API is recommended,
+ * because window embedding can cause various issues, especially with GUI
+ * toolkits and certain platforms.
  *
  * OpenGL interop
  * --------------
@@ -60,12 +60,13 @@ extern "C" {
  * pointers returned by the get_proc_address callback in mpv_opengl_cb_init_gl.
  * Generally, mpv will not load the system OpenGL library when using this API.
  *
- * Only "desktop" OpenGL version 2.1 or later is supported. With OpenGL 2.1,
- * the GL_ARB_texture_rg is required. The renderer was written against
- * OpenGL 3.x core profile, with additional support for OpenGL 2.1.
+ * Only "desktop" OpenGL version 2.1 and later and OpenGL ES version 2.0 and
+ * later are supported. With OpenGL 2.1, the GL_ARB_texture_rg is required. The
+ * renderer was written for the OpenGL 3.x core profile, with additional support
+ * for OpenGL 2.1 and OpenGL ES 2.0.
  *
  * Note that some hardware decoding interop API (as set with the "hwdec" option)
- * may actually access
+ * may actually access some sort of host API, such as EGL.
  *
  * OpenGL state
  * ------------
@@ -75,14 +76,20 @@ extern "C" {
  * defaults. Likewise, mpv will attempt to leave the OpenGL context with
  * standard defaults. The following state is excluded from this:
  *
- *      - the current viewport (can have/is set to an arbitrary value)
+ *      - the glViewport state
+ *      - the glScissor state (but GL_SCISSOR_TEST is in its default value)
+ *      - glBlendFuncSeparate() state (but GL_BLEND is in its default value)
+ *      - glClearColor() state
+ *      - mpv may overwrite the callback set with glDebugMessageCallback()
+ *      - mpv always disables GL_DITHER at init
  *
  * Messing with the state could be avoided by creating shared OpenGL contexts,
  * but this is avoided for the sake of compatibility and interoperability.
  *
  * On OpenGL 2.1, mpv will strictly call functions like glGenTextures() to
  * create OpenGL objects. You will have to do the same. This ensures that
- * objects created by mpv and the API users don't clash.
+ * objects created by mpv and the API users don't clash. Also, legacy state
+ * must be either in its defaults, or not interfere with core state.
  *
  * Threading
  * ---------
@@ -90,7 +97,7 @@ extern "C" {
  * The mpv_opengl_cb_* functions can be called from any thread, under the
  * following conditions:
  *  - only one of the mpv_opengl_cb_* functions can be called at the same time
- *    (unless they belong to different mpv_handles)
+ *    (unless they belong to different mpv cores created by mpv_create())
  *  - for functions which need an OpenGL context (see above) the OpenGL context
  *    must be "current" in the current thread, and it must be the same context
  *    as used with mpv_opengl_cb_init_gl()
@@ -107,6 +114,87 @@ extern "C" {
  * When the mpv core is destroyed (e.g. via mpv_terminate_destroy()), the OpenGL
  * context must have been uninitialized. If this doesn't happen, undefined
  * behavior will result.
+ *
+ * Hardware decoding
+ * -----------------
+ *
+ * Hardware decoding via opengl_cb is fully supported, but requires some
+ * additional setup. (At least if direct hardware decoding modes are wanted,
+ * instead of copying back surface data from GPU to CPU RAM.)
+ *
+ * While "normal" mpv loads the OpenGL hardware decoding interop on demand,
+ * this can't be done with opengl_cb for internal technical reasons. Instead,
+ * it loads them by default, even if hardware decoding is not going to be used.
+ * In older mpv releases, this had to be done by setting the
+ * "opengl-hwdec-interop" or "hwdec-preload" options before calling
+ * mpv_opengl_cb_init_gl(). You can still use the newer "gpu-hwdec-interop"
+ * option to prevent loading of interop, or to load only a specific interop.
+ *
+ * There may be certain requirements on the OpenGL implementation:
+ * - Windows: ANGLE is required (although in theory GL/DX interop could be used)
+ * - Intel/Linux: EGL is required, and also a glMPGetNativeDisplay() callback
+ *                must be provided (see sections below)
+ * - nVidia/Linux: Both GLX and EGL should work (GLX is required if vdpau is
+ *                 used, e.g. due to old drivers.)
+ * - OSX: CGL is required (CGLGetCurrentContext() returning non-NULL)
+ * - iOS: EAGL is required (EAGLContext.currentContext returning non-nil)
+ *
+ * Once these things are setup, hardware decoding can be enabled/disabled at
+ * any time by setting the "hwdec" property.
+ *
+ * Special windowing system interop considerations
+ * ------------------------------------------------
+ *
+ * In some cases, libmpv needs to have access to the windowing system's handles.
+ * This can be a pointer to a X11 "Display" for example. Usually this is needed
+ * only for hardware decoding.
+ *
+ * You can communicate these handles to libmpv by adding a pseudo-OpenGL
+ * extension "GL_MP_MPGetNativeDisplay" to the additional extension string when
+ * calling mpv_opengl_cb_init_gl(). The get_proc_address callback should resolve
+ * a function named "glMPGetNativeDisplay", which has the signature:
+ *
+ *    void* GLAPIENTRY glMPGetNativeDisplay(const char* name)
+ *
+ * See below what names are defined. Usually, libmpv will use the native handle
+ * up until mpv_opengl_cb_uninit_gl() is called. If the name is not anything
+ * you know/expected, return NULL from the function.
+ */
+
+// Legacy - not supported anymore.
+struct mpv_opengl_cb_window_pos {
+    int x;      // left coordinates of window (usually 0)
+    int y;      // top coordinates of window (usually 0)
+    int width;  // width of GL window
+    int height; // height of GL window
+};
+
+// Legacy - not supported anymore.
+struct mpv_opengl_cb_drm_params {
+    // DRM fd (int). set this to -1 if invalid.
+    int fd;
+
+    // currently used crtc id
+    int crtc_id;
+
+    // currently used connector id
+    int connector_id;
+
+    // pointer to the drmModeAtomicReq that is being used for the renderloop.
+    // This atomic request pointer should be usually created at every renderloop.
+    struct _drmModeAtomicReq *atomic_request;
+};
+
+/**
+ * nVidia/Linux via VDPAU requires GLX, which does not have this problem (the
+ * GLX API can return the current X11 Display).
+ *
+ * Windowing system interop on MS win32
+ * ------------------------------------
+ *
+ * You should use ANGLE, and make sure your application and libmpv are linked
+ * to the same ANGLE DLLs. libmpv will pick the device context (needed for
+ * hardware decoding) from the current ANGLE EGL context.
  */
 
 /**
@@ -125,7 +213,8 @@ typedef void *(*mpv_opengl_cb_get_proc_address_fn)(void *fn_ctx, const char *nam
  * Set the callback that notifies you when a new video frame is available, or
  * if the video display configuration somehow changed and requires a redraw.
  * Similar to mpv_set_wakeup_callback(), you must not call any mpv API from
- * the callback.
+ * the callback, and all the other listed restrictions apply (such as not
+ * exiting the callback by throwing exceptions).
  *
  * @param callback callback(callback_ctx) is called if the frame should be
  *                 redrawn
@@ -196,7 +285,7 @@ int mpv_opengl_cb_init_gl(mpv_opengl_cb_context *ctx, const char *exts,
  * @param h Height of the framebuffer. Same as with the w parameter, except
  *          that this parameter can be negative. In this case, the video
  *          frame will be rendered flipped.
- * @return the number of left frames in the internal queue to be rendered
+ * @return 0
  */
 int mpv_opengl_cb_draw(mpv_opengl_cb_context *ctx, int fbo, int w, int h);
 
@@ -217,10 +306,14 @@ int mpv_opengl_cb_render(mpv_opengl_cb_context *ctx, int fbo, int vp[4]);
  * Tell the renderer that a frame was flipped at the given time. This is
  * optional, but can help the player to achieve better timing.
  *
+ * Note that calling this at least once informs libmpv that you will use this
+ * function. If you use it inconsistently, expect bad video playback.
+ *
  * If this is called while no video or no OpenGL is initialized, it is ignored.
  *
  * @param time The mpv time (using mpv_get_time_us()) at which the flip call
  *             returned. If 0 is passed, mpv_get_time_us() is used instead.
+ *             Currently, this parameter is ignored.
  * @return error code
  */
 int mpv_opengl_cb_report_flip(mpv_opengl_cb_context *ctx, int64_t time);
@@ -240,5 +333,7 @@ int mpv_opengl_cb_uninit_gl(mpv_opengl_cb_context *ctx);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* else #if MPV_ENABLE_DEPRECATED */
 
 #endif

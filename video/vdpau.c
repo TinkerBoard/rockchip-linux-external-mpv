@@ -17,6 +17,9 @@
 
 #include <assert.h>
 
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vdpau.h>
+
 #include "vdpau.h"
 
 #include "osdep/threads.h"
@@ -28,72 +31,6 @@
 #include "mp_image_pool.h"
 #include "vdpau_mixer.h"
 
-static struct mp_image *download_image(struct mp_hwdec_ctx *hwctx,
-                                       struct mp_image *mpi,
-                                       struct mp_image_pool *swpool)
-{
-    struct mp_vdpau_ctx *ctx = hwctx->vdpau_ctx;
-    struct vdp_functions *vdp = &ctx->vdp;
-    VdpStatus vdp_st;
-
-    struct mp_image *res = NULL;
-    int w = mpi->params.d_w;
-    int h = mpi->params.d_h;
-
-    // Abuse this lock for our own purposes. It could use its own lock instead.
-    pthread_mutex_lock(&ctx->pool_lock);
-
-    if (ctx->getimg_surface == VDP_INVALID_HANDLE ||
-        ctx->getimg_w < w || ctx->getimg_h < h)
-    {
-        if (ctx->getimg_surface != VDP_INVALID_HANDLE) {
-            vdp_st = vdp->output_surface_destroy(ctx->getimg_surface);
-            CHECK_VDP_WARNING(ctx, "Error when calling vdp_output_surface_destroy");
-        }
-        ctx->getimg_surface = VDP_INVALID_HANDLE;
-        vdp_st = vdp->output_surface_create(ctx->vdp_device,
-                                            VDP_RGBA_FORMAT_B8G8R8A8, w, h,
-                                            &ctx->getimg_surface);
-        CHECK_VDP_WARNING(ctx, "Error when calling vdp_output_surface_create");
-        if (vdp_st != VDP_STATUS_OK)
-            goto error;
-        ctx->getimg_w = w;
-        ctx->getimg_h = h;
-    }
-
-    if (!ctx->getimg_mixer)
-        ctx->getimg_mixer = mp_vdpau_mixer_create(ctx, ctx->log);
-
-    VdpRect in = { .x1 = mpi->w, .y1 = mpi->h };
-    VdpRect out = { .x1 = w, .y1 = h };
-    if (mp_vdpau_mixer_render(ctx->getimg_mixer, NULL, ctx->getimg_surface, &out,
-                              mpi, &in) < 0)
-        goto error;
-
-    res = mp_image_pool_get(swpool, IMGFMT_BGR0, ctx->getimg_w, ctx->getimg_h);
-    if (!res)
-        goto error;
-
-    void *dst_planes[] = { res->planes[0] };
-    uint32_t dst_pitches[] = { res->stride[0] };
-    vdp_st = vdp->output_surface_get_bits_native(ctx->getimg_surface, NULL,
-                                                 dst_planes, dst_pitches);
-    CHECK_VDP_WARNING(ctx, "Error when calling vdp_output_surface_get_bits_native");
-    if (vdp_st != VDP_STATUS_OK)
-        goto error;
-
-    mp_image_set_size(res, w, h);
-    mp_image_copy_attributes(res, mpi);
-
-    pthread_mutex_unlock(&ctx->pool_lock);
-    return res;
-error:
-    talloc_free(res);
-    MP_WARN(ctx, "Error copying image from GPU.\n");
-    pthread_mutex_unlock(&ctx->pool_lock);
-    return NULL;
-}
-
 static void mark_vdpau_objects_uninitialized(struct mp_vdpau_ctx *ctx)
 {
     for (int i = 0; i < MAX_VIDEO_SURFACES; i++) {
@@ -102,6 +39,7 @@ static void mark_vdpau_objects_uninitialized(struct mp_vdpau_ctx *ctx)
         ctx->video_surfaces[i].allocated = false;
     }
     ctx->vdp_device = VDP_INVALID_HANDLE;
+    ctx->preemption_obj = VDP_INVALID_HANDLE;
 }
 
 static void preemption_callback(VdpDevice device, void *context)
@@ -113,7 +51,7 @@ static void preemption_callback(VdpDevice device, void *context)
     pthread_mutex_unlock(&ctx->preempt_lock);
 }
 
-static int win_x11_init_vdpau_procs(struct mp_vdpau_ctx *ctx)
+static int win_x11_init_vdpau_procs(struct mp_vdpau_ctx *ctx, bool probing)
 {
     Display *x11 = ctx->x11;
     VdpStatus vdp_st;
@@ -142,11 +80,14 @@ static int win_x11_init_vdpau_procs(struct mp_vdpau_ctx *ctx)
     vdp_st = vdp_device_create_x11(x11, DefaultScreen(x11), &ctx->vdp_device,
                                    &get_proc_address);
     if (vdp_st != VDP_STATUS_OK) {
-        if (ctx->is_preempted)
+        if (ctx->is_preempted) {
             MP_DBG(ctx, "Error calling vdp_device_create_x11 while preempted: %d\n",
                    vdp_st);
-        else
-            MP_ERR(ctx, "Error when calling vdp_device_create_x11: %d\n", vdp_st);
+        } else {
+            int lev = probing ? MSGL_V : MSGL_ERR;
+            mp_msg(ctx->log, lev, "Error when calling vdp_device_create_x11: %d\n",
+                   vdp_st);
+        }
         return -1;
     }
 
@@ -163,6 +104,22 @@ static int win_x11_init_vdpau_procs(struct mp_vdpau_ctx *ctx)
 
     ctx->vdp = vdp;
     ctx->get_proc_address = get_proc_address;
+
+    if (ctx->av_device_ref) {
+        AVHWDeviceContext *hwctx = (void *)ctx->av_device_ref->data;
+        AVVDPAUDeviceContext *vdctx = hwctx->hwctx;
+
+        vdctx->device = ctx->vdp_device;
+        vdctx->get_proc_address = ctx->get_proc_address;
+    }
+
+    vdp_st = vdp.output_surface_create(ctx->vdp_device, VDP_RGBA_FORMAT_B8G8R8A8,
+                                       1, 1, &ctx->preemption_obj);
+    if (vdp_st != VDP_STATUS_OK) {
+        MP_ERR(ctx, "Could not create dummy object: %s",
+               vdp.get_error_string(vdp_st));
+        return -1;
+    }
 
     vdp.preemption_callback_register(ctx->vdp_device, preemption_callback, ctx);
     return 0;
@@ -182,7 +139,7 @@ static int handle_preemption(struct mp_vdpau_ctx *ctx)
     if (ctx->last_preemption_retry_fail &&
         mp_time_sec() - ctx->last_preemption_retry_fail < 1.0)
         return -1;
-    if (win_x11_init_vdpau_procs(ctx) < 0) {
+    if (win_x11_init_vdpau_procs(ctx, false) < 0) {
         ctx->last_preemption_retry_fail = mp_time_sec();
         return -1;
     }
@@ -197,6 +154,7 @@ static int handle_preemption(struct mp_vdpau_ctx *ctx)
 // Check whether vdpau display preemption happened. The caller provides a
 // preemption counter, which contains the logical timestamp of the last
 // preemption handled by the caller. The counter can be 0 for init.
+// If counter is NULL, only ever return -1 or 1.
 // Return values:
 //  -1: the display is currently preempted, and vdpau can't be used
 //   0: a preemption event happened, and the caller must recover
@@ -207,14 +165,19 @@ int mp_vdpau_handle_preemption(struct mp_vdpau_ctx *ctx, uint64_t *counter)
     int r = 1;
     pthread_mutex_lock(&ctx->preempt_lock);
 
+    const void *p[4] = {&(uint32_t){0}};
+    uint32_t stride[4] = {4};
+    VdpRect rc = {0};
+    ctx->vdp.output_surface_put_bits_native(ctx->preemption_obj, p, stride, &rc);
+
     // First time init
-    if (!*counter)
+    if (counter && !*counter)
         *counter = ctx->preemption_counter;
 
     if (handle_preemption(ctx) < 0)
         r = -1;
 
-    if (r > 0 && *counter < ctx->preemption_counter) {
+    if (counter && r > 0 && *counter < ctx->preemption_counter) {
         *counter = ctx->preemption_counter;
         r = 0; // signal recovery after preemption
     }
@@ -250,8 +213,7 @@ static struct mp_image *create_ref(struct mp_vdpau_ctx *ctx, int index)
     struct surface_ref *ref = talloc_ptrtype(NULL, ref);
     *ref = (struct surface_ref){ctx, index};
     struct mp_image *res =
-        mp_image_new_custom_ref(&(struct mp_image){0}, ref,
-                                release_decoder_surface);
+        mp_image_new_custom_ref(NULL, ref, release_decoder_surface);
     if (res) {
         mp_image_setfmt(res, e->rgb ? IMGFMT_VDPAU_OUTPUT : IMGFMT_VDPAU);
         mp_image_set_size(res, e->w, e->h);
@@ -329,16 +291,22 @@ static struct mp_image *mp_vdpau_get_surface(struct mp_vdpau_ctx *ctx,
             e->rgb = rgb;
             e->w = w;
             e->h = h;
-            if (rgb) {
-                vdp_st = vdp->output_surface_create(ctx->vdp_device, rgb_format,
-                                                    w, h, &e->osurface);
-                e->allocated = e->osurface != VDP_INVALID_HANDLE;
+            if (mp_vdpau_handle_preemption(ctx, NULL) >= 0) {
+                if (rgb) {
+                    vdp_st = vdp->output_surface_create(ctx->vdp_device, rgb_format,
+                                                        w, h, &e->osurface);
+                    e->allocated = e->osurface != VDP_INVALID_HANDLE;
+                } else {
+                    vdp_st = vdp->video_surface_create(ctx->vdp_device, chroma,
+                                                    w, h, &e->surface);
+                    e->allocated = e->surface != VDP_INVALID_HANDLE;
+                }
+                CHECK_VDP_WARNING(ctx, "Error when allocating surface");
             } else {
-                vdp_st = vdp->video_surface_create(ctx->vdp_device, chroma,
-                                                   w, h, &e->surface);
-                e->allocated = e->surface != VDP_INVALID_HANDLE;
+                e->allocated = false;
+                e->osurface = VDP_INVALID_HANDLE;
+                e->surface = VDP_INVALID_HANDLE;
             }
-            CHECK_VDP_WARNING(ctx, "Error when allocating surface");
             surface_index = n;
             goto done;
         }
@@ -362,35 +330,10 @@ struct mp_image *mp_vdpau_get_video_surface(struct mp_vdpau_ctx *ctx,
     return mp_vdpau_get_surface(ctx, chroma, 0, false, w, h);
 }
 
-struct mp_vdpau_ctx *mp_vdpau_create_device_x11(struct mp_log *log, Display *x11)
+static void free_device_ref(struct AVHWDeviceContext *hwctx)
 {
-    struct mp_vdpau_ctx *ctx = talloc_ptrtype(NULL, ctx);
-    *ctx = (struct mp_vdpau_ctx) {
-        .log = log,
-        .x11 = x11,
-        .preemption_counter = 1,
-        .hwctx = {
-            .type = HWDEC_VDPAU,
-            .priv = ctx,
-            .vdpau_ctx = ctx,
-            .download_image = download_image,
-        },
-        .getimg_surface = VDP_INVALID_HANDLE,
-    };
-    mpthread_mutex_init_recursive(&ctx->preempt_lock);
-    pthread_mutex_init(&ctx->pool_lock, NULL);
+    struct mp_vdpau_ctx *ctx = hwctx->user_opaque;
 
-    mark_vdpau_objects_uninitialized(ctx);
-
-    if (win_x11_init_vdpau_procs(ctx) < 0) {
-        mp_vdpau_destroy(ctx);
-        return NULL;
-    }
-    return ctx;
-}
-
-void mp_vdpau_destroy(struct mp_vdpau_ctx *ctx)
-{
     struct vdp_functions *vdp = &ctx->vdp;
     VdpStatus vdp_st;
 
@@ -407,10 +350,8 @@ void mp_vdpau_destroy(struct mp_vdpau_ctx *ctx)
         }
     }
 
-    if (ctx->getimg_mixer)
-        mp_vdpau_mixer_destroy(ctx->getimg_mixer);
-    if (ctx->getimg_surface != VDP_INVALID_HANDLE) {
-        vdp_st = vdp->output_surface_destroy(ctx->getimg_surface);
+    if (ctx->preemption_obj != VDP_INVALID_HANDLE) {
+        vdp_st = vdp->output_surface_destroy(ctx->preemption_obj);
         CHECK_VDP_WARNING(ctx, "Error when calling vdp_output_surface_destroy");
     }
 
@@ -419,9 +360,65 @@ void mp_vdpau_destroy(struct mp_vdpau_ctx *ctx)
         CHECK_VDP_WARNING(ctx, "Error when calling vdp_device_destroy");
     }
 
+    if (ctx->close_display)
+        XCloseDisplay(ctx->x11);
+
     pthread_mutex_destroy(&ctx->pool_lock);
     pthread_mutex_destroy(&ctx->preempt_lock);
     talloc_free(ctx);
+}
+
+struct mp_vdpau_ctx *mp_vdpau_create_device_x11(struct mp_log *log, Display *x11,
+                                                bool probing)
+{
+    AVBufferRef *avref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VDPAU);
+    if (!avref)
+        return NULL;
+
+    AVHWDeviceContext *hwctx = (void *)avref->data;
+    AVVDPAUDeviceContext *vdctx = hwctx->hwctx;
+
+    struct mp_vdpau_ctx *ctx = talloc_ptrtype(NULL, ctx);
+    *ctx = (struct mp_vdpau_ctx) {
+        .log = log,
+        .x11 = x11,
+        .preemption_counter = 1,
+        .av_device_ref = avref,
+        .hwctx = {
+            .av_device_ref = avref,
+        },
+    };
+    mpthread_mutex_init_recursive(&ctx->preempt_lock);
+    pthread_mutex_init(&ctx->pool_lock, NULL);
+
+    hwctx->free = free_device_ref;
+    hwctx->user_opaque = ctx;
+
+    mark_vdpau_objects_uninitialized(ctx);
+
+    if (win_x11_init_vdpau_procs(ctx, probing) < 0) {
+        mp_vdpau_destroy(ctx);
+        return NULL;
+    }
+
+    vdctx->device = ctx->vdp_device;
+    vdctx->get_proc_address = ctx->get_proc_address;
+
+    if (av_hwdevice_ctx_init(ctx->av_device_ref) < 0) {
+        mp_vdpau_destroy(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+void mp_vdpau_destroy(struct mp_vdpau_ctx *ctx)
+{
+    if (!ctx)
+        return;
+
+    AVBufferRef *ref = ctx->av_device_ref;
+    av_buffer_unref(&ref); // frees ctx as well
 }
 
 bool mp_vdpau_get_format(int imgfmt, VdpChromaType *out_chroma_type,
@@ -436,10 +433,6 @@ bool mp_vdpau_get_format(int imgfmt, VdpChromaType *out_chroma_type,
         break;
     case IMGFMT_NV12:
         ycbcr = VDP_YCBCR_FORMAT_NV12;
-        break;
-    case IMGFMT_YUYV:
-        ycbcr = VDP_YCBCR_FORMAT_YUYV;
-        chroma = VDP_CHROMA_TYPE_422;
         break;
     case IMGFMT_UYVY:
         ycbcr = VDP_YCBCR_FORMAT_UYVY;
@@ -533,3 +526,49 @@ bool mp_vdpau_guess_if_emulated(struct mp_vdpau_ctx *ctx)
     CHECK_VDP_WARNING(ctx, "Error when calling vdp_get_information_string");
     return vdp_st == VDP_STATUS_OK && info && strstr(info, "VAAPI");
 }
+
+// (This clearly works only for contexts wrapped by our code.)
+struct mp_vdpau_ctx *mp_vdpau_get_ctx_from_av(AVBufferRef *hw_device_ctx)
+{
+    AVHWDeviceContext *hwctx = (void *)hw_device_ctx->data;
+
+    if (hwctx->free != free_device_ref)
+        return NULL; // not ours
+
+    return hwctx->user_opaque;
+}
+
+static bool is_emulated(struct AVBufferRef *hw_device_ctx)
+{
+    struct mp_vdpau_ctx *ctx = mp_vdpau_get_ctx_from_av(hw_device_ctx);
+    if (!ctx)
+        return false;
+
+    return mp_vdpau_guess_if_emulated(ctx);
+}
+
+static struct AVBufferRef *vdpau_create_standalone(struct mpv_global *global,
+        struct mp_log *log, struct hwcontext_create_dev_params *params)
+{
+    XInitThreads();
+
+    Display *display = XOpenDisplay(NULL);
+    if (!display)
+        return NULL;
+
+    struct mp_vdpau_ctx *vdp =
+        mp_vdpau_create_device_x11(log, display, params->probing);
+    if (!vdp) {
+        XCloseDisplay(display);
+        return NULL;
+    }
+
+    vdp->close_display = true;
+    return vdp->hwctx.av_device_ref;
+}
+
+const struct hwcontext_fns hwcontext_fns_vdpau = {
+    .av_hwdevice_type = AV_HWDEVICE_TYPE_VDPAU,
+    .create_dev = vdpau_create_standalone,
+    .is_emulated = is_emulated,
+};

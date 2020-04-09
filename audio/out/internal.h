@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MP_AO_INTERNAL_H_
@@ -21,7 +21,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-#include "osdep/atomics.h"
+#include "osdep/atomic.h"
 #include "audio/out/ao.h"
 
 /* global data used by ao.c and ao drivers */
@@ -40,17 +40,26 @@ struct ao {
     const struct ao_driver *api; // entrypoints to the wrapper (push.c/pull.c)
     const struct ao_driver *driver;
     void *priv;
+    struct mpv_global *global;
     struct encode_lavc_context *encode_lavc_ctx;
-    struct input_ctx *input_ctx;
+    void (*wakeup_cb)(void *ctx);
+    void *wakeup_ctx;
     struct mp_log *log; // Using e.g. "[ao/coreaudio]" as prefix
+    int init_flags; // AO_INIT_* flags
+    bool stream_silence;        // if audio inactive, just play silence
+
+    // Set by the driver on init. This is typically the period size, and the
+    // smallest unit the driver will accept in one piece (although if
+    // AOPLAY_FINAL_CHUNK is set, the driver must accept everything).
+    // This value is in complete samples (i.e. 1 for stereo means 1 sample
+    // for both channels each).
+    // Used for push based API only.
+    int period_size;
 
     // The device as selected by the user, usually using ao_device_desc.name
     // from an entry from the list returned by driver->list_devices. If the
     // default device should be used, this is set to NULL.
     char *device;
-
-    // Device actually chosen by the AO
-    char *detected_device;
 
     // Application name to report to the audio API.
     char *client_name;
@@ -60,6 +69,9 @@ struct ao {
 
     // Internal events (use ao_request_reload(), ao_hotplug_event())
     atomic_int events_;
+
+    // Float gain multiplicator
+    mp_atomic_float gain;
 
     int buffer;
     double def_buffer;
@@ -118,6 +130,10 @@ struct ao_driver {
     const char *name;
     // Description shown with --ao=help.
     const char *description;
+    // This requires waiting for a AO_EVENT_INITIAL_UNBLOCK event before the
+    // first play() call is done. Encode mode uses this, and push mode
+    // respects it automatically (don't use with pull mode).
+    bool initially_blocked;
     // Init the device using ao->format/ao->channels/ao->samplerate. If the
     // device doesn't accept these parameters, you can attempt to negotiate
     // fallback parameters, and set the ao format fields accordingly.
@@ -178,6 +194,8 @@ struct ao_driver {
     int priv_size;
     const void *priv_defaults;
     const struct m_option *options;
+    const char *options_prefix;
+    const struct m_sub_options *global_opts;
 };
 
 // These functions can be called by AOs.
@@ -191,6 +209,8 @@ void ao_wakeup_poll(struct ao *ao);
 
 bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
                          struct mp_chmap *map);
+bool ao_chmap_sel_adjust2(struct ao *ao, const struct mp_chmap_sel *s,
+                          struct mp_chmap *map, bool safe_multichannel);
 bool ao_chmap_sel_get_def(struct ao *ao, const struct mp_chmap_sel *s,
                           struct mp_chmap *map, int num);
 
@@ -198,5 +218,22 @@ bool ao_chmap_sel_get_def(struct ao *ao, const struct mp_chmap_sel *s,
 // Call from ao_driver->list_devs callback only.
 void ao_device_list_add(struct ao_device_list *list, struct ao *ao,
                         struct ao_device_desc *e);
+
+void ao_post_process_data(struct ao *ao, void **data, int num_samples);
+
+struct ao_convert_fmt {
+    int src_fmt;        // source AF_FORMAT_*
+    int channels;       // number of channels
+    int dst_bits;       // total target data sample size
+    int pad_msb;        // padding in the MSB (i.e. required shifting)
+    int pad_lsb;        // padding in LSB (required 0 bits) (ignored)
+};
+
+bool ao_can_convert_inplace(struct ao_convert_fmt *fmt);
+bool ao_need_conversion(struct ao_convert_fmt *fmt);
+void ao_convert_inplace(struct ao_convert_fmt *fmt, void **data, int num_samples);
+
+int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
+                           void **data, int samples, int64_t out_time_us);
 
 #endif

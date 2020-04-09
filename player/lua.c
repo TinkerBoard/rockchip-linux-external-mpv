@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <assert.h>
@@ -30,7 +30,7 @@
 
 #include "osdep/io.h"
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #include "common/common.h"
 #include "options/m_property.h"
@@ -44,6 +44,7 @@
 #include "osdep/subprocess.h"
 #include "osdep/timer.h"
 #include "osdep/threads.h"
+#include "osdep/getpid.h"
 #include "stream/stream.h"
 #include "sub/osd.h"
 #include "core.h"
@@ -68,6 +69,9 @@ static const char * const builtin_lua_scripts[][2] = {
     },
     {"@ytdl_hook.lua",
 #   include "player/lua/ytdl_hook.inc"
+    },
+    {"@stats.lua",
+#   include "player/lua/stats.inc"
     },
     {0}
 };
@@ -190,10 +194,8 @@ static void add_functions(struct script_ctx *ctx);
 static void load_file(lua_State *L, const char *fname)
 {
     struct script_ctx *ctx = get_ctx(L);
-    char *res_name = mp_get_user_path(NULL, ctx->mpctx->global, fname);
-    MP_VERBOSE(ctx, "loading file %s\n", res_name);
-    int r = luaL_loadfile(L, res_name);
-    talloc_free(res_name); // careful to not leak this on Lua errors
+    MP_DBG(ctx, "loading file %s\n", fname);
+    int r = luaL_loadfile(L, fname);
     if (r)
         lua_error(L);
     lua_call(L, 0, 0);
@@ -221,7 +223,7 @@ static int load_builtin(lua_State *L)
 static void require(lua_State *L, const char *name)
 {
     struct script_ctx *ctx = get_ctx(L);
-    MP_VERBOSE(ctx, "loading %s\n", name);
+    MP_DBG(ctx, "loading %s\n", name);
     // Lazy, but better than calling the "require" function manually
     char buf[80];
     snprintf(buf, sizeof(buf), "require '%s'", name);
@@ -277,16 +279,10 @@ static void set_path(lua_State *L)
     const char *path = lua_tostring(L, -1);
 
     char *newpath = talloc_strdup(tmp, path ? path : "");
-    char *dirs[] = {"scripts", "lua", NULL};
-    for (int s = 0; dirs[s]; s++) {
-        char **luadir = mp_find_all_config_files(tmp, get_mpctx(L)->global,
-                                                 dirs[s]);
-        for (int i = 0; luadir && luadir[i]; i++) {
-            // No need to display a warning for lua files in the deprecated
-            // 'lua' dirs since scripting.c already warned on them
-            newpath = talloc_asprintf_append(newpath, ";%s",
-                    mp_path_join(tmp, bstr0(luadir[i]), bstr0("?.lua")));
-        }
+    char **luadir = mp_find_all_config_files(tmp, get_mpctx(L)->global, "scripts");
+    for (int i = 0; luadir && luadir[i]; i++) {
+        newpath = talloc_asprintf_append(newpath, ";%s",
+                        mp_path_join(tmp, luadir[i], "?.lua"));
     }
 
     lua_pushstring(L, newpath);  // package path newpath
@@ -383,8 +379,10 @@ static int load_lua(struct mpv_handle *client, const char *fname)
     }
 
     lua_State *L = ctx->state = luaL_newstate();
-    if (!L)
+    if (!L) {
+        MP_FATAL(ctx, "Could not initialize Lua.\n");
         goto error_out;
+    }
 
     if (mp_cpcall(L, run_lua, ctx)) {
         const char *err = "unknown error";
@@ -397,7 +395,6 @@ static int load_lua(struct mpv_handle *client, const char *fname)
     r = 0;
 
 error_out:
-    mp_resume_all(client);
     if (ctx->state)
         lua_close(ctx->state);
     talloc_free(ctx);
@@ -455,20 +452,17 @@ static int script_find_config_file(lua_State *L)
 static int script_suspend(lua_State *L)
 {
     struct script_ctx *ctx = get_ctx(L);
-    mpv_suspend(ctx->client);
+    MP_ERR(ctx, "mp.suspend() is deprecated and does nothing.\n");
     return 0;
 }
 
 static int script_resume(lua_State *L)
 {
-    struct script_ctx *ctx = get_ctx(L);
-    mpv_resume(ctx->client);
     return 0;
 }
 
 static int script_resume_all(lua_State *L)
 {
-    mp_resume_all(get_ctx(L)->client);
     return 0;
 }
 
@@ -518,6 +512,27 @@ static int script_wait_event(lua_State *L)
         lua_setfield(L, -2, "args"); // event
         break;
     }
+    case MPV_EVENT_END_FILE: {
+        mpv_event_end_file *eef = event->data;
+        const char *reason;
+        switch (eef->reason) {
+        case MPV_END_FILE_REASON_EOF: reason = "eof"; break;
+        case MPV_END_FILE_REASON_STOP: reason = "stop"; break;
+        case MPV_END_FILE_REASON_QUIT: reason = "quit"; break;
+        case MPV_END_FILE_REASON_ERROR: reason = "error"; break;
+        case MPV_END_FILE_REASON_REDIRECT: reason = "redirect"; break;
+        default:
+            reason = "unknown";
+        }
+        lua_pushstring(L, reason); // event reason
+        lua_setfield(L, -2, "reason"); // event
+
+        if (eef->reason == MPV_END_FILE_REASON_ERROR) {
+            lua_pushstring(L, mpv_error_string(eef->error)); // event error
+            lua_setfield(L, -2, "error"); // event
+        }
+        break;
+    }
     case MPV_EVENT_PROPERTY_CHANGE: {
         mpv_event_property *prop = event->data;
         lua_pushstring(L, prop->name);
@@ -539,6 +554,12 @@ static int script_wait_event(lua_State *L)
             lua_pushnil(L);
         }
         lua_setfield(L, -2, "data");
+        break;
+    }
+    case MPV_EVENT_HOOK: {
+        mpv_event_hook *hook = event->data;
+        lua_pushinteger(L, hook->id);
+        lua_setfield(L, -2, "hook_id");
         break;
     }
     default: ;
@@ -692,7 +713,7 @@ static void makenode(void *tmp, mpv_node *dst, lua_State *L, int t)
                 bool empty = lua_isnil(L, -1); // t[n]
                 lua_pop(L, 1); // -
                 if (empty) {
-                    count = n;
+                    count = n - 1;
                     break;
                 }
             }
@@ -734,7 +755,7 @@ static void makenode(void *tmp, mpv_node *dst, lua_State *L, int t)
                 makenode(tmp, &list->values[list->num], L, -1);
                 if (lua_type(L, -2) != LUA_TSTRING) {
                     luaL_error(L, "key must be a string, but got %s",
-                               lua_typename(L, -2));
+                               lua_typename(L, lua_type(L, -2)));
                 }
                 list->keys[list->num] = talloc_strdup(tmp, lua_tostring(L, -2));
                 list->num++;
@@ -948,29 +969,21 @@ static int script_command_native(lua_State *L)
 
 static int script_set_osd_ass(lua_State *L)
 {
-    struct MPContext *mpctx = get_mpctx(L);
+    struct script_ctx *ctx = get_ctx(L);
     int res_x = luaL_checkinteger(L, 1);
     int res_y = luaL_checkinteger(L, 2);
     const char *text = luaL_checkstring(L, 3);
-    osd_set_external(mpctx->osd, res_x, res_y, (char *)text);
-    mp_input_wakeup(mpctx->input);
+    if (!text[0])
+        text = " "; // force external OSD initialization
+    osd_set_external(ctx->mpctx->osd, ctx->client, res_x, res_y, (char *)text);
+    mp_wakeup_core(ctx->mpctx);
     return 0;
 }
 
-static int script_get_osd_resolution(lua_State *L)
+static int script_get_osd_size(lua_State *L)
 {
     struct MPContext *mpctx = get_mpctx(L);
-    int w, h;
-    osd_object_get_resolution(mpctx->osd, OSDTYPE_EXTERNAL, &w, &h);
-    lua_pushnumber(L, w);
-    lua_pushnumber(L, h);
-    return 2;
-}
-
-static int script_get_screen_size(lua_State *L)
-{
-    struct MPContext *mpctx = get_mpctx(L);
-    struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd, OSDTYPE_EXTERNAL);
+    struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd);
     double aspect = 1.0 * vo_res.w / MPMAX(vo_res.h, 1) /
                     (vo_res.display_par ? vo_res.display_par : 1);
     lua_pushnumber(L, vo_res.w);
@@ -979,10 +992,10 @@ static int script_get_screen_size(lua_State *L)
     return 3;
 }
 
-static int script_get_screen_margins(lua_State *L)
+static int script_get_osd_margins(lua_State *L)
 {
     struct MPContext *mpctx = get_mpctx(L);
-    struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd, OSDTYPE_EXTERNAL);
+    struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd);
     lua_pushnumber(L, vo_res.ml);
     lua_pushnumber(L, vo_res.mt);
     lua_pushnumber(L, vo_res.mr);
@@ -995,10 +1008,8 @@ static int script_get_mouse_pos(lua_State *L)
     struct MPContext *mpctx = get_mpctx(L);
     int px, py;
     mp_input_get_mouse_pos(mpctx->input, &px, &py);
-    double sw, sh;
-    osd_object_get_scale_factor(mpctx->osd, OSDTYPE_EXTERNAL, &sw, &sh);
-    lua_pushnumber(L, px * sw);
-    lua_pushnumber(L, py * sh);
+    lua_pushnumber(L, px);
+    lua_pushnumber(L, py);
     return 2;
 }
 
@@ -1009,70 +1020,15 @@ static int script_get_time(lua_State *L)
     return 1;
 }
 
-static int script_input_define_section(lua_State *L)
-{
-    struct MPContext *mpctx = get_mpctx(L);
-    char *section = (char *)luaL_checkstring(L, 1);
-    char *contents = (char *)luaL_checkstring(L, 2);
-    char *flags = (char *)luaL_optstring(L, 3, "");
-    bool builtin = true;
-    if (strcmp(flags, "default") == 0) {
-        builtin = true;
-    } else if (strcmp(flags, "force") == 0) {
-        builtin = false;
-    } else if (strcmp(flags, "") == 0) {
-        //pass
-    } else {
-        luaL_error(L, "invalid flags: '%s'", flags);
-    }
-    mp_input_define_section(mpctx->input, section, "<script>", contents, builtin);
-    return 0;
-}
-
-static int script_input_enable_section(lua_State *L)
-{
-    struct MPContext *mpctx = get_mpctx(L);
-    char *section = (char *)luaL_checkstring(L, 1);
-    char *sflags = (char *)luaL_optstring(L, 2, "");
-    bstr bflags = bstr0(sflags);
-    int flags = 0;
-    while (bflags.len) {
-        bstr val;
-        bstr_split_tok(bflags, "|", &val, &bflags);
-        if (bstr_equals0(val, "allow-hide-cursor")) {
-            flags |= MP_INPUT_ALLOW_HIDE_CURSOR;
-        } else if (bstr_equals0(val, "allow-vo-dragging")) {
-            flags |= MP_INPUT_ALLOW_VO_DRAGGING;
-        } else if (bstr_equals0(val, "exclusive")) {
-            flags |= MP_INPUT_EXCLUSIVE;
-        } else {
-            luaL_error(L, "invalid flag");
-        }
-    }
-    mp_input_enable_section(mpctx->input, section, flags);
-    return 0;
-}
-
-static int script_input_disable_section(lua_State *L)
-{
-    struct MPContext *mpctx = get_mpctx(L);
-    char *section = (char *)luaL_checkstring(L, 1);
-    mp_input_disable_section(mpctx->input, section);
-    return 0;
-}
-
 static int script_input_set_section_mouse_area(lua_State *L)
 {
     struct MPContext *mpctx = get_mpctx(L);
 
-    double sw, sh;
-    osd_object_get_scale_factor(mpctx->osd, OSDTYPE_EXTERNAL, &sw, &sh);
-
     char *section = (char *)luaL_checkstring(L, 1);
-    int x0 = sw ? luaL_checkinteger(L, 2) / sw : 0;
-    int y0 = sh ? luaL_checkinteger(L, 3) / sh : 0;
-    int x1 = sw ? luaL_checkinteger(L, 4) / sw : 0;
-    int y1 = sh ? luaL_checkinteger(L, 5) / sh : 0;
+    int x0 = luaL_checkinteger(L, 2);
+    int y0 = luaL_checkinteger(L, 3);
+    int x1 = luaL_checkinteger(L, 4);
+    int y1 = luaL_checkinteger(L, 5);
     mp_input_set_section_mouse_area(mpctx->input, section, x0, y0, x1, y1);
     return 0;
 }
@@ -1094,6 +1050,22 @@ static int script_get_wakeup_pipe(lua_State *L)
     struct script_ctx *ctx = get_ctx(L);
     lua_pushinteger(L, mpv_get_wakeup_pipe(ctx->client));
     return 1;
+}
+
+static int script_raw_hook_add(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    uint64_t ud = luaL_checkinteger(L, 1);
+    const char *name = luaL_checkstring(L, 2);
+    int pri = luaL_checkinteger(L, 3);
+    return check_error(L, mpv_hook_add(ctx->client, ud, name, pri));
+}
+
+static int script_raw_hook_continue(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    lua_Integer id = luaL_checkinteger(L, 1);
+    return check_error(L, mpv_hook_continue(ctx->client, id));
 }
 
 static int script_readdir(lua_State *L)
@@ -1131,7 +1103,50 @@ static int script_readdir(lua_State *L)
         lua_pushstring(L, name); // list index name
         lua_settable(L, -3); // list
     }
+    closedir(dir);
     talloc_free(fullpath);
+    return 1;
+}
+
+static int script_file_info(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+
+    struct stat statbuf;
+    if (stat(path, &statbuf) != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "error");
+        return 2;
+    }
+
+    lua_newtable(L); // Result stat table
+
+    const char * stat_names[] = {
+        "mode", "size",
+        "atime", "mtime", "ctime", NULL
+    };
+    const unsigned int stat_values[] = {
+        statbuf.st_mode,
+        statbuf.st_size,
+        statbuf.st_atime,
+        statbuf.st_mtime,
+        statbuf.st_ctime
+    };
+
+    // Add all fields
+    for (int i = 0; stat_names[i]; i++) {
+        lua_pushinteger(L, stat_values[i]);
+        lua_setfield(L, -2, stat_names[i]);
+    }
+
+    // Convenience booleans
+    lua_pushboolean(L, S_ISREG(statbuf.st_mode));
+    lua_setfield(L, -2, "is_file");
+
+    lua_pushboolean(L, S_ISDIR(statbuf.st_mode));
+    lua_setfield(L, -2, "is_dir");
+
+    // Return table
     return 1;
 }
 
@@ -1148,7 +1163,7 @@ static int script_join_path(lua_State *L)
 {
     const char *p1 = luaL_checkstring(L, 1);
     const char *p2 = luaL_checkstring(L, 2);
-    char *r = mp_path_join(NULL, bstr0(p1), bstr0(p2));
+    char *r = mp_path_join(NULL, p1, p2);
     lua_pushstring(L, r);
     talloc_free(r);
     return 1;
@@ -1180,8 +1195,6 @@ static int script_subprocess(lua_State *L)
     luaL_checktype(L, 1, LUA_TTABLE);
     void *tmp = mp_lua_PITA(L);
 
-    mp_resume_all(ctx->client);
-
     lua_getfield(L, 1, "args"); // args
     int num_args = mp_lua_len(L, -1);
     char *args[256];
@@ -1207,7 +1220,7 @@ static int script_subprocess(lua_State *L)
     lua_pop(L, 1); // -
 
     lua_getfield(L, 1, "max_size"); // m
-    int64_t max_size = lua_isnil(L, -1) ? 16 * 1024 * 1024 : lua_tointeger(L, -1);
+    int64_t max_size = lua_isnil(L, -1) ? 64 * 1024 * 1024 : lua_tointeger(L, -1);
 
     struct subprocess_cb_ctx cb_ctx = {
         .log = ctx->log,
@@ -1228,6 +1241,43 @@ static int script_subprocess(lua_State *L)
     lua_setfield(L, -2, "status"); // res
     lua_pushlstring(L, cb_ctx.output.start, cb_ctx.output.len); // res d
     lua_setfield(L, -2, "stdout"); // res
+    lua_pushboolean(L, status == MP_SUBPROCESS_EKILLED_BY_US); // res b
+    lua_setfield(L, -2, "killed_by_us"); // res
+    return 1;
+}
+
+static int script_subprocess_detached(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    void *tmp = mp_lua_PITA(L);
+
+    lua_getfield(L, 1, "args"); // args
+    int num_args = mp_lua_len(L, -1);
+    char *args[256];
+    if (num_args > MP_ARRAY_SIZE(args) - 1) // last needs to be NULL
+        luaL_error(L, "too many arguments");
+    if (num_args < 1)
+        luaL_error(L, "program name missing");
+    for (int n = 0; n < num_args; n++) {
+        lua_pushinteger(L, n + 1); // args n
+        lua_gettable(L, -2); // args arg
+        args[n] = talloc_strdup(tmp, lua_tostring(L, -1));
+        if (!args[n])
+            luaL_error(L, "program arguments must be strings");
+        lua_pop(L, 1); // args
+    }
+    args[num_args] = NULL;
+    lua_pop(L, 1); // -
+
+    mp_subprocess_detached(ctx->log, args);
+    lua_pushnil(L);
+    return 1;
+}
+
+static int script_getpid(lua_State *L)
+{
+    lua_pushnumber(L, mp_getpid());
     return 1;
 }
 
@@ -1299,26 +1349,27 @@ static const struct fn_entry main_fns[] = {
     FN_ENTRY(raw_observe_property),
     FN_ENTRY(raw_unobserve_property),
     FN_ENTRY(set_osd_ass),
-    FN_ENTRY(get_osd_resolution),
-    FN_ENTRY(get_screen_size),
-    FN_ENTRY(get_screen_margins),
+    FN_ENTRY(get_osd_size),
+    FN_ENTRY(get_osd_margins),
     FN_ENTRY(get_mouse_pos),
     FN_ENTRY(get_time),
-    FN_ENTRY(input_define_section),
-    FN_ENTRY(input_enable_section),
-    FN_ENTRY(input_disable_section),
     FN_ENTRY(input_set_section_mouse_area),
     FN_ENTRY(format_time),
     FN_ENTRY(enable_messages),
     FN_ENTRY(get_wakeup_pipe),
+    FN_ENTRY(raw_hook_add),
+    FN_ENTRY(raw_hook_continue),
     {0}
 };
 
 static const struct fn_entry utils_fns[] = {
     FN_ENTRY(readdir),
+    FN_ENTRY(file_info),
     FN_ENTRY(split_path),
     FN_ENTRY(join_path),
     FN_ENTRY(subprocess),
+    FN_ENTRY(subprocess_detached),
+    FN_ENTRY(getpid),
     FN_ENTRY(parse_json),
     FN_ENTRY(format_json),
     {0}
@@ -1357,6 +1408,7 @@ static void add_functions(struct script_ctx *ctx)
 }
 
 const struct mp_scripting mp_scripting_lua = {
+    .name = "lua script",
     .file_ext = "lua",
     .load = load_lua,
 };

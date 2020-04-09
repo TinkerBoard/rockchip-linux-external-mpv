@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_BSTR_H
@@ -24,7 +24,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "osdep/compiler.h"
 
 /* NOTE: 'len' is size_t, but most string-handling functions below assume
@@ -80,6 +80,10 @@ double bstrtod(struct bstr str, struct bstr *rest);
 void bstr_lower(struct bstr str);
 int bstr_sscanf(struct bstr str, const char *format, ...);
 
+// Decode a string containing hexadecimal data. All whitespace will be silently
+// ignored. When successful, this allocates a new array to store the output.
+bool bstr_decode_hex(void *talloc_ctx, struct bstr hex, struct bstr *out);
+
 // Decode the UTF-8 code point at the start of the string, and return the
 // character.
 // After calling this function, *out_next will point to the next character.
@@ -116,10 +120,15 @@ int bstr_validate_utf8(struct bstr s);
 // talloc, with talloc_ctx as parent.
 struct bstr bstr_sanitize_utf8_latin1(void *talloc_ctx, struct bstr s);
 
-// Return the text before the next line break, and return it. Change *rest to
-// point to the text following this line break. (rest can be NULL.)
-// Line break characters are not stripped.
-struct bstr bstr_getline(struct bstr str, struct bstr *rest);
+// Return the text before the occurrence of a character, and return it. Change
+// *rest to point to the text following this character. (rest can be NULL.)
+struct bstr bstr_splitchar(struct bstr str, struct bstr *rest, const char c);
+
+// Like bstr_splitchar. Trailing newlines are not stripped.
+static inline struct bstr bstr_getline(struct bstr str, struct bstr *rest)
+{
+    return bstr_splitchar(str, rest, '\n');
+}
 
 // Strip one trailing line break. This is intended for use with bstr_getline,
 // and will remove the trailing \n or \r\n sequence.
@@ -131,8 +140,10 @@ void bstr_xappend_asprintf(void *talloc_ctx, bstr *s, const char *fmt, ...)
 void bstr_xappend_vasprintf(void *talloc_ctx, bstr *s, const char *fmt, va_list va)
     PRINTF_ATTRIBUTE(3, 0);
 
-// If s starts with prefix, return true and return the rest of the string in s.
+// If s starts/ends with prefix, return true and return the rest of the string
+// in s.
 bool bstr_eatstart(struct bstr *s, struct bstr prefix);
+bool bstr_eatend(struct bstr *s, struct bstr prefix);
 
 bool bstr_case_startswith(struct bstr s, struct bstr prefix);
 bool bstr_case_endswith(struct bstr s, struct bstr suffix);
@@ -182,12 +193,15 @@ static inline int bstrcmp0(struct bstr str1, const char *str2)
 
 static inline bool bstr_equals(struct bstr str1, struct bstr str2)
 {
-    return bstrcmp(str1, str2) == 0;
+    if (str1.len != str2.len)
+        return false;
+
+    return str1.start == str2.start || bstrcmp(str1, str2) == 0;
 }
 
 static inline bool bstr_equals0(struct bstr str1, const char *str2)
 {
-    return bstrcmp(str1, bstr0(str2)) == 0;
+    return bstr_equals(str1, bstr0(str2));
 }
 
 static inline int bstrcasecmp0(struct bstr str1, const char *str2)
@@ -200,9 +214,14 @@ static inline int bstr_find0(struct bstr haystack, const char *needle)
     return bstr_find(haystack, bstr0(needle));
 }
 
-static inline int bstr_eatstart0(struct bstr *s, const char *prefix)
+static inline bool bstr_eatstart0(struct bstr *s, const char *prefix)
 {
     return bstr_eatstart(s, bstr0(prefix));
+}
+
+static inline bool bstr_eatend0(struct bstr *s, const char *prefix)
+{
+    return bstr_eatend(s, bstr0(prefix));
 }
 
 // create a pair (not single value!) for "%.*s" printf syntax

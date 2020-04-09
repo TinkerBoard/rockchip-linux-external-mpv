@@ -1,10 +1,10 @@
 JSON IPC
 ========
 
-mpv can be controlled by external programs using the JSON-based IPC protocol. It
-can be enabled by specifying the path to a unix socket using the option
-``--input-unix-socket``. Clients can connect to this socket and send commands to
-the player or receive events from it.
+mpv can be controlled by external programs using the JSON-based IPC protocol.
+It can be enabled by specifying the path to a unix socket or a named pipe using
+the option ``--input-ipc-server``. Clients can connect to this socket and send
+commands to the player or receive events from it.
 
 .. warning::
 
@@ -17,12 +17,12 @@ the player or receive events from it.
 Socat example
 -------------
 
-You can use the ``socat`` tool to send commands (and receive reply) from the
+You can use the ``socat`` tool to send commands (and receive replies) from the
 shell. Assuming mpv was started with:
 
 ::
 
-    mpv file.mkv --input-unix-socket=/tmp/mpvsocket
+    mpv file.mkv --input-ipc-server=/tmp/mpvsocket
 
 Then you can control it using socat:
 
@@ -41,10 +41,35 @@ It's also possible to send input.conf style text-only commands:
 
 ::
 
-    > echo 'show_text ${playback-time}' | socat - /tmp/mpvsocket
+    > echo 'show-text ${playback-time}' | socat - /tmp/mpvsocket
 
 But you won't get a reply over the socket. (This particular command shows the
 playback time on the player's OSD.)
+
+Command Prompt example
+----------------------
+
+Unfortunately, it's not as easy to test the IPC protocol on Windows, since
+Windows ports of socat (in Cygwin and MSYS2) don't understand named pipes. In
+the absence of a simple tool to send and receive from bidirectional pipes, the
+``echo`` command can be used to send commands, but not receive replies from the
+command prompt.
+
+Assuming mpv was started with:
+
+::
+
+    mpv file.mkv --input-ipc-server=\\.\pipe\mpvsocket
+
+You can send commands from a command prompt:
+
+::
+
+    echo show-text ${playback-time} >\\.\pipe\mpvsocket
+
+To be able to simultaneously read and write from the IPC pipe, like on Linux,
+it's necessary to write an external program that uses overlapped file I/O (or
+some wrapper like .NET's NamedPipeClientStream.)
 
 Protocol
 --------
@@ -79,12 +104,30 @@ mpv will also send events to clients with JSON messages of the following form:
 where ``event_name`` is the name of the event. Additional event-specific fields
 can also be present. See `List of events`_ for a list of all supported events.
 
+Because events can occur at any time, it may be difficult at times to determine
+which response goes with which command. Commands may optionally include a
+``request_id`` which, if provided in the command request, will be copied
+verbatim into the response. mpv does not intrepret the ``request_id`` in any
+way; it is solely for the use of the requester.
+
+For example, this request:
+
+::
+
+    { "command": ["get_property", "time-pos"], "request_id": 100 }
+
+Would generate this response:
+
+::
+
+    { "error": "success", "data": 1.468135, "request_id": 100 }
+
 All commands, replies, and events are separated from each other with a line
 break character (``\n``).
 
 If the first character (after skipping whitespace) is not ``{``, the command
 will be interpreted as non-JSON text command, as they are used in input.conf
-(or ``mpv_command_string()`` in the client API). Additionally, line starting
+(or ``mpv_command_string()`` in the client API). Additionally, lines starting
 with ``#`` and empty lines are ignored.
 
 Currently, embedded 0 bytes terminate the current line, but you should not
@@ -93,7 +136,7 @@ rely on this.
 Commands
 --------
 
-Additionally to  the commands described in `List of Input Commands`_, a few
+In addition to the commands described in `List of Input Commands`_, a few
 extra commands can also be used as part of the protocol:
 
 ``client_name``
@@ -137,14 +180,7 @@ extra commands can also be used as part of the protocol:
         { "error": "success" }
 
 ``set_property_string``
-    Like ``set_property``, but the argument value must be passed as string.
-
-    Example:
-
-    ::
-
-        { "command": ["set_property_string", "pause", "yes"] }
-        { "error": "success" }
+    Alias for ``set_property``. Both commands accept native values and strings.
 
 ``observe_property``
     Watch a property for changes. If the given property is changed, then an
@@ -157,6 +193,14 @@ extra commands can also be used as part of the protocol:
         { "command": ["observe_property", 1, "volume"] }
         { "error": "success" }
         { "event": "property-change", "id": 1, "data": 52.0, "name": "volume" }
+
+    .. warning::
+
+        If the connection is closed, the IPC client is destroyed internally,
+        and the observed properties are unregistered. This happens for example
+        when sending commands to a socket with separate ``socat`` invocations.
+        This can make it seem like property observation does not work. You must
+        keep the IPC connection open to make it work.
 
 ``observe_property_string``
     Like ``observe_property``, but the resulting data will always be a string.
@@ -171,7 +215,7 @@ extra commands can also be used as part of the protocol:
 
 ``unobserve_property``
     Undo ``observe_property`` or ``observe_property_string``. This requires the
-    numeric id passed to the observe command as argument.
+    numeric id passed to the observed command as argument.
 
     Example:
 
@@ -198,19 +242,11 @@ extra commands can also be used as part of the protocol:
     By default, most events are enabled, and there is not much use for this
     command.
 
-``suspend``
-    Suspend the mpv main loop. There is a long-winded explanation of this in
-    the C API function ``mpv_suspend()``. In short, this prevents the player
-    from displaying the next video frame, so that you don't get blocked when
-    trying to access the player.
-
-``resume``
-    Undo one ``suspend`` call. ``suspend`` increments an internal counter, and
-    ``resume`` decrements it. When 0 is reached, the player is actually resumed.
-
 ``get_version``
     Returns the client API version the C API of the remote mpv instance
-    provides. (Also see ``DOCS/client-api-changes.rst``.)
+    provides.
+
+    See also: ``DOCS/client-api-changes.rst``.
 
 UTF-8
 -----

@@ -1,21 +1,19 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <libavutil/common.h>
 
 #include "input/input.h"
 #include "input/keycodes.h"
@@ -25,23 +23,20 @@
 #include "events_view.h"
 
 @interface MpvEventsView()
-@property(nonatomic, assign) BOOL clearing;
 @property(nonatomic, assign) BOOL hasMouseDown;
 @property(nonatomic, retain) NSTrackingArea *tracker;
-- (BOOL)hasDock:(NSScreen*)screen;
-- (BOOL)hasMenubar:(NSScreen*)screen;
 - (int)mpvButtonNumber:(NSEvent*)event;
 - (void)mouseDownEvent:(NSEvent *)event;
 - (void)mouseUpEvent:(NSEvent *)event;
 @end
 
 @implementation MpvEventsView
-@synthesize clearing = _clearing;
 @synthesize adapter = _adapter;
 @synthesize tracker = _tracker;
 @synthesize hasMouseDown = _mouse_down;
 
-- (id)initWithFrame:(NSRect)frame {
+- (id)initWithFrame:(NSRect)frame
+{
     self = [super initWithFrame:frame];
     if (self) {
         [self registerForDraggedTypes:@[NSFilenamesPboardType,
@@ -49,54 +44,6 @@
         [self setAutoresizingMask:NSViewWidthSizable|NSViewHeightSizable];
     }
     return self;
-}
-
-- (void)setFullScreen:(BOOL)willBeFullscreen
-{
-    if (willBeFullscreen && ![self isInFullScreenMode]) {
-        NSApplicationPresentationOptions popts =
-            NSApplicationPresentationDefault;
-
-        if ([self hasMenubar:[self.adapter fsScreen]])
-            // Cocoa raises an exception when autohiding the menubar but
-            // not the dock. They probably got bored while programming the
-            // multi screen support and took some shortcuts (tested on 10.8).
-            popts |= NSApplicationPresentationAutoHideMenuBar |
-                     NSApplicationPresentationAutoHideDock;
-
-        if ([self hasDock:[self.adapter fsScreen]])
-            popts |= NSApplicationPresentationAutoHideDock;
-
-        NSDictionary *fsopts = @{
-            NSFullScreenModeAllScreens : @([self.adapter fsModeAllScreens]),
-            NSFullScreenModeApplicationPresentationOptions : @(popts)
-        };
-
-        // The original "windowed" window will stay around since sending a
-        // view fullscreen wraps it in another window. This is noticeable when
-        // sending the View fullscreen to another screen. Make it go away
-        // manually.
-        [self.window orderOut:self];
-
-        [self enterFullScreenMode:[self.adapter fsScreen]
-                                  withOptions:fsopts];
-    }
-
-    if (!willBeFullscreen && [self isInFullScreenMode]) {
-        [self exitFullScreenModeWithOptions:nil];
-
-        // Show the "windowed" window again.
-        [self.window makeKeyAndOrderFront:self];
-        [self.window makeFirstResponder:self];
-    }
-}
-
-- (void)clear
-{
-    if ([self isInFullScreenMode]) {
-        self.clearing = YES;
-        [self exitFullScreenModeWithOptions:nil];
-    }
 }
 
 // mpv uses flipped coordinates, because X11 uses those. So let's just use them
@@ -123,6 +70,9 @@
                                      userInfo:nil] autorelease];
 
     [self addTrackingArea:self.tracker];
+
+    if (![self containsMouseLocation])
+        [self.adapter putKey:MP_KEY_MOUSE_LEAVE withModifiers:0];
 }
 
 - (NSPoint)mouseLocation
@@ -132,7 +82,19 @@
 
 - (BOOL)containsMouseLocation
 {
-    NSRect vF  = [[self.window screen] visibleFrame];
+    CGFloat topMargin = 0.0;
+    CGFloat menuBarHeight = [[NSApp mainMenu] menuBarHeight];
+
+    // menuBarHeight is 0 when menu bar is hidden in fullscreen
+    // 1pt to compensate of the black line beneath the menu bar
+    if ([self.adapter isInFullScreenMode] && menuBarHeight > 0) {
+        NSRect tr = [NSWindow frameRectForContentRect:CGRectZero
+                                            styleMask:NSWindowStyleMaskTitled];
+        topMargin = tr.size.height + 1 + menuBarHeight;
+    }
+
+    NSRect vF  = [[self.window screen] frame];
+    vF.size.height -= topMargin;
     NSRect vFW = [self.window convertRectFromScreen:vF];
     NSRect vFV = [self convertRect:vFW fromView:nil];
     NSPoint pt = [self convertPoint:[self mouseLocation] fromView:nil];
@@ -146,23 +108,18 @@
 {
     return [self.adapter mouseEnabled];
 }
-- (BOOL)acceptsFirstResponder {
+
+- (BOOL)acceptsFirstResponder
+{
     return [self.adapter keyboardEnabled] || [self.adapter mouseEnabled];
 }
 
-- (BOOL)becomeFirstResponder {
+- (BOOL)becomeFirstResponder
+{
     return [self.adapter keyboardEnabled] || [self.adapter mouseEnabled];
 }
 
 - (BOOL)resignFirstResponder { return YES; }
-
-- (void)keyDown:(NSEvent *)event {
-    [self.adapter putKeyEvent:event];
-}
-
-- (void)keyUp:(NSEvent *)event {
-    [self.adapter putKeyEvent:event];
-}
 
 - (BOOL)canHideCursor
 {
@@ -187,16 +144,6 @@
     }
 }
 
-- (void)setFrameSize:(NSSize)size
-{
-    [super setFrameSize:size];
-
-    if (self.clearing)
-        return;
-
-    [self signalMousePosition];
-}
-
 - (NSPoint)convertPointToPixels:(NSPoint)point
 {
     point = [self convertPoint:point fromView:nil];
@@ -205,14 +152,6 @@
     // coordinate system
     point.y = -point.y;
     return point;
-}
-
-- (void)signalMousePosition
-{
-    NSPoint p = [self convertPointToPixels:[self mouseLocation]];
-    p.x = MIN(MAX(p.x, 0), self.bounds.size.width-1);
-    p.y = MIN(MAX(p.y, 0), self.bounds.size.height-1);
-    [self.adapter signalMouseMovement:p];
 }
 
 - (void)signalMouseMovement:(NSEvent *)event
@@ -247,6 +186,7 @@
         [super mouseDown:event];
     }
 }
+
 - (void)mouseUp:(NSEvent *)event
 {
     if ([self.adapter mouseEnabled]) {
@@ -255,6 +195,7 @@
         [super mouseUp:event];
     }
 }
+
 - (void)rightMouseDown:(NSEvent *)event
 {
     if ([self.adapter mouseEnabled]) {
@@ -296,15 +237,15 @@
     CGFloat delta;
     int cmd;
 
-    if (FFABS([event deltaY]) >= FFABS([event deltaX])) {
+    if (fabs([event deltaY]) >= fabs([event deltaX])) {
         delta = [event deltaY] * 0.1;
-        cmd   = delta > 0 ? MP_AXIS_UP : MP_AXIS_DOWN;
+        cmd   = delta > 0 ? MP_WHEEL_UP : MP_WHEEL_DOWN;
     } else {
         delta = [event deltaX] * 0.1;
-        cmd   = delta > 0 ? MP_AXIS_RIGHT : MP_AXIS_LEFT;
+        cmd   = delta > 0 ? MP_WHEEL_RIGHT : MP_WHEEL_LEFT;
     }
 
-    [self.adapter putAxis:cmd delta:FFABS(delta)];
+    [self.adapter putWheel:cmd delta:fabs(delta)];
 }
 
 - (void)scrollWheel:(NSEvent *)event
@@ -318,7 +259,18 @@
         [self preciseScroll:event];
     } else {
         const int modifiers = [event modifierFlags];
-        const int mpkey = [event deltaY] > 0 ? MP_MOUSE_BTN3 : MP_MOUSE_BTN4;
+        const float deltaX = (modifiers & NSEventModifierFlagShift) ?
+                             [event scrollingDeltaY] : [event scrollingDeltaX];
+        const float deltaY = (modifiers & NSEventModifierFlagShift) ?
+                             [event scrollingDeltaX] : [event scrollingDeltaY];
+        int mpkey;
+
+        if (fabs(deltaY) >= fabs(deltaX)) {
+            mpkey = deltaY > 0 ? MP_WHEEL_UP : MP_WHEEL_DOWN;
+        } else {
+            mpkey = deltaX > 0 ? MP_WHEEL_LEFT : MP_WHEEL_RIGHT;
+        }
+
         [self.adapter putKey:mpkey withModifiers:modifiers];
     }
 }
@@ -339,7 +291,7 @@
 - (void)putMouseEvent:(NSEvent *)event withState:(int)state
 {
     self.hasMouseDown = (state == MP_KEY_STATE_DOWN);
-    int mpkey = (MP_MOUSE_BTN0 + [self mpvButtonNumber:event]);
+    int mpkey = [self mpvButtonNumber:event];
     [self.adapter putKey:(mpkey | state) withModifiers:[event modifierFlags]];
 }
 
@@ -348,55 +300,38 @@
     NSPasteboard *pboard = [sender draggingPasteboard];
     NSArray *types = [pboard types];
     if ([types containsObject:NSFilenamesPboardType] ||
-        [types containsObject:NSURLPboardType])
+        [types containsObject:NSURLPboardType]) {
         return NSDragOperationCopy;
-    else
+    } else {
         return NSDragOperationNone;
+    }
 }
 
 - (BOOL)performDragOperation:(id <NSDraggingInfo>)sender
 {
     NSPasteboard *pboard = [sender draggingPasteboard];
-    if ([[pboard types] containsObject:NSURLPboardType]) {
-        NSURL *file_url = [NSURL URLFromPasteboard:pboard];
-        [self.adapter handleFilesArray:@[[file_url absoluteString]]];
-        return YES;
-    } else if ([[pboard types] containsObject:NSFilenamesPboardType]) {
+    if ([[pboard types] containsObject:NSFilenamesPboardType]) {
         NSArray *pbitems = [pboard propertyListForType:NSFilenamesPboardType];
         [self.adapter handleFilesArray:pbitems];
         return YES;
+    } else if ([[pboard types] containsObject:NSURLPboardType]) {
+        NSURL *url = [NSURL URLFromPasteboard:pboard];
+        [self.adapter handleFilesArray:@[[url absoluteString]]];
+        return YES;
     }
     return NO;
-}
-
-- (BOOL)hasDock:(NSScreen*)screen
-{
-    NSRect vF = [screen visibleFrame];
-    NSRect f  = [screen frame];
-    return
-        // The visible frame's width is smaller: dock is on left or right end
-        // of this method's receiver.
-        vF.size.width < f.size.width ||
-        // The visible frame's veritical origin is bigger: dock is
-        // on the bottom of this method's receiver.
-        vF.origin.y > f.origin.y;
-
-}
-
-- (BOOL)hasMenubar:(NSScreen*)screen
-{
-    NSRect vF = [screen visibleFrame];
-    NSRect f  = [screen frame];
-    return f.size.height + f.origin.y > vF.size.height + vF.origin.y;
 }
 
 - (int)mpvButtonNumber:(NSEvent*)event
 {
     int buttonNumber = [event buttonNumber];
     switch (buttonNumber) {
-        case 1:  return 2;
-        case 2:  return 1;
-        default: return buttonNumber;
+        case 0:  return MP_MBTN_LEFT;
+        case 1:  return MP_MBTN_RIGHT;
+        case 2:  return MP_MBTN_MID;
+        case 3:  return MP_MBTN_BACK;
+        case 4:  return MP_MBTN_FORWARD;
+        default: return MP_MBTN9 - 5 + buttonNumber;
     }
 }
 @end

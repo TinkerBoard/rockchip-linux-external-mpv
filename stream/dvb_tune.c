@@ -1,6 +1,7 @@
 /* dvbtune - tune.c
 
    Copyright (C) Dave Chapman 2001,2002
+   Copyright (C) Rozhuk Ivan <rozhuk.im@gmail.com> 2016 - 2017
 
    Modified for use with MPlayer, for details see the changelog at
    http://svn.mplayerhq.hu/mplayer/trunk/
@@ -40,71 +41,169 @@
 #include "dvb_tune.h"
 #include "common/msg.h"
 
-int dvb_get_tuner_type(int fe_fd, struct mp_log *log)
+/* Keep in sync with enum fe_delivery_system. */
+static const char *dvb_delsys_str[] = {
+    "UNDEFINED",
+    "DVB-C ANNEX A",
+    "DVB-C ANNEX B",
+    "DVB-T",
+    "DSS",
+    "DVB-S",
+    "DVB-S2",
+    "DVB-H",
+    "ISDBT",
+    "ISDBS",
+    "ISDBC",
+    "ATSC",
+    "ATSCMH",
+    "DTMB",
+    "CMMB",
+    "DAB",
+    "DVB-T2",
+    "TURBO",
+    "DVB-C ANNEX C",
+    NULL
+};
+
+const char *get_dvb_delsys(unsigned int delsys)
 {
-    struct dvb_frontend_info fe_info;
-    int res = ioctl(fe_fd, FE_GET_INFO, &fe_info);
-    if (res < 0) {
-        mp_err(log, "FE_GET_INFO error: %d, FD: %d\n\n", errno, fe_fd);
-        return 0;
-    }
-
-    switch (fe_info.type) {
-    case FE_OFDM:
-        mp_verbose(log, "TUNER TYPE SEEMS TO BE DVB-T\n");
-        return TUNER_TER;
-
-    case FE_QPSK:
-        mp_verbose(log, "TUNER TYPE SEEMS TO BE DVB-S\n");
-        return TUNER_SAT;
-
-    case FE_QAM:
-        mp_verbose(log, "TUNER TYPE SEEMS TO BE DVB-C\n");
-        return TUNER_CBL;
-
-#ifdef DVB_ATSC
-    case FE_ATSC:
-        mp_verbose(log, "TUNER TYPE SEEMS TO BE DVB-ATSC\n");
-        return TUNER_ATSC;
-#endif
-    default:
-        mp_err(log, "UNKNOWN TUNER TYPE\n");
-        return 0;
-    }
-
+    if (SYS_DVB__COUNT__ <= delsys)
+        return dvb_delsys_str[0];
+    return dvb_delsys_str[delsys];
 }
 
-int dvb_open_devices(dvb_priv_t *priv, int n, int demux_cnt)
+unsigned int dvb_get_tuner_delsys_mask(int fe_fd, struct mp_log *log)
 {
-    int i;
-    char frontend_dev[32], dvr_dev[32], demux_dev[32];
+    unsigned int ret_mask = 0, delsys;
+    struct dtv_property prop[1];
+    struct dtv_properties cmdseq = {.num = 1, .props = prop};
+    struct dvb_frontend_info fe_info;
 
-    sprintf(frontend_dev, "/dev/dvb/adapter%d/frontend0", n);
-    sprintf(dvr_dev, "/dev/dvb/adapter%d/dvr0", n);
-    sprintf(demux_dev, "/dev/dvb/adapter%d/demux0", n);
-    priv->fe_fd = open(frontend_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (priv->fe_fd < 0) {
+#ifdef DVB_USE_S2API
+    /* S2API is the DVB API new since 2.6.28.
+       It allows to query frontends with multiple delivery systems. */
+    mp_verbose(log, "Querying tuner frontend type via DVBv5 API for frontend FD %d\n",
+               fe_fd);
+    prop[0].cmd = DTV_ENUM_DELSYS;
+    if (ioctl(fe_fd, FE_GET_PROPERTY, &cmdseq) < 0) {
+        mp_err(log, "DVBv5: FE_GET_PROPERTY(DTV_ENUM_DELSYS) error: %d, FD: %d\n\n", errno, fe_fd);
+        goto old_api;
+    }
+    unsigned int i, delsys_count = prop[0].u.buffer.len;
+    mp_verbose(log, "DVBv5: Number of supported delivery systems: %d\n", delsys_count);
+    if (delsys_count == 0) {
+        mp_err(log, "DVBv5: Frontend FD %d returned no delivery systems!\n", fe_fd);
+        goto old_api;
+    }
+    for (i = 0; i < delsys_count; i++) {
+        delsys = (unsigned int)prop[0].u.buffer.data[i];
+        DELSYS_SET(ret_mask, delsys);
+        mp_verbose(log, "DVBv5: Tuner frontend type seems to be %s\n", get_dvb_delsys(delsys));
+    }
+
+    return ret_mask;
+
+old_api:
+#endif
+    mp_verbose(log, "Querying tuner frontend type via pre-DVBv5 API for frontend FD %d\n",
+               fe_fd);
+
+    memset(&fe_info, 0x00, sizeof(struct dvb_frontend_info));
+    if (ioctl(fe_fd, FE_GET_INFO, &fe_info) < 0) {
+        mp_err(log, "DVBv3: FE_GET_INFO error: %d, FD: %d\n\n", errno, fe_fd);
+        return ret_mask;
+    }
+    /* Try to get kernel DVB API version. */
+    prop[0].cmd = DTV_API_VERSION;
+    if (ioctl(fe_fd, FE_GET_PROPERTY, &cmdseq) < 0) {
+        prop[0].u.data = 0x0300; /* Fail, assume 3.0 */
+    }
+
+    mp_verbose(log, "DVBv3: Queried tuner frontend type of device named '%s', FD: %d\n",
+               fe_info.name, fe_fd);
+    switch (fe_info.type) {
+    case FE_OFDM:
+        DELSYS_SET(ret_mask, SYS_DVBT);
+        if (prop[0].u.data < 0x0500)
+            break;
+        if (FE_CAN_2G_MODULATION & fe_info.caps) {
+            DELSYS_SET(ret_mask, SYS_DVBT2);
+        }
+        break;
+    case FE_QPSK:
+        DELSYS_SET(ret_mask, SYS_DVBS);
+        if (prop[0].u.data < 0x0500)
+            break;
+        if (FE_CAN_2G_MODULATION & fe_info.caps) {
+            DELSYS_SET(ret_mask, SYS_DVBS2);
+        }
+#if 0 /* Not used now. */
+        if (FE_CAN_TURBO_FEC & fe_info.caps) {
+            DELSYS_SET(ret_mask, SYS_TURBO);
+        }
+#endif
+        break;
+    case FE_QAM:
+        DELSYS_SET(ret_mask, SYS_DVBC_ANNEX_A);
+        DELSYS_SET(ret_mask, SYS_DVBC_ANNEX_C);
+        break;
+#ifdef DVB_ATSC
+    case FE_ATSC:
+        if ((FE_CAN_8VSB | FE_CAN_16VSB) & fe_info.caps) {
+            DELSYS_SET(ret_mask, SYS_ATSC);
+        }
+        if ((FE_CAN_QAM_64 | FE_CAN_QAM_256 | FE_CAN_QAM_AUTO) & fe_info.caps) {
+            DELSYS_SET(ret_mask, SYS_DVBC_ANNEX_B);
+        }
+        break;
+#endif
+    default:
+        mp_err(log, "DVBv3: Unknown tuner frontend type: %d\n", fe_info.type);
+        return ret_mask;
+    }
+
+    for (delsys = 0; delsys < SYS_DVB__COUNT__; delsys ++) {
+        if (!DELSYS_IS_SET(ret_mask, delsys))
+            continue; /* Skip unsupported. */
+        mp_verbose(log, "DVBv3: Tuner frontend type seems to be %s\n", get_dvb_delsys(delsys));
+    }
+
+    return ret_mask;
+}
+
+int dvb_open_devices(dvb_priv_t *priv, unsigned int adapter,
+    unsigned int frontend, unsigned int demux_cnt)
+{
+    unsigned int i;
+    char frontend_dev[PATH_MAX], dvr_dev[PATH_MAX], demux_dev[PATH_MAX];
+    dvb_state_t* state = priv->state;
+
+    snprintf(frontend_dev, sizeof(frontend_dev), "/dev/dvb/adapter%u/frontend%u", adapter, frontend);
+    snprintf(dvr_dev, sizeof(dvr_dev), "/dev/dvb/adapter%u/dvr0", adapter);
+    snprintf(demux_dev, sizeof(demux_dev), "/dev/dvb/adapter%u/demux0", adapter);
+    MP_VERBOSE(priv, "DVB_OPEN_DEVICES: frontend: %s\n", frontend_dev);
+    state->fe_fd = open(frontend_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (state->fe_fd < 0) {
         MP_ERR(priv, "ERROR OPENING FRONTEND DEVICE %s: ERRNO %d\n",
                frontend_dev, errno);
         return 0;
     }
-    priv->demux_fds_cnt = 0;
+    state->demux_fds_cnt = 0;
     MP_VERBOSE(priv, "DVB_OPEN_DEVICES(%d)\n", demux_cnt);
     for (i = 0; i < demux_cnt; i++) {
-        priv->demux_fds[i] = open(demux_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-        if (priv->demux_fds[i] < 0) {
+        state->demux_fds[i] = open(demux_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (state->demux_fds[i] < 0) {
             MP_ERR(priv, "ERROR OPENING DEMUX 0: %d\n", errno);
             return 0;
         } else {
             MP_VERBOSE(priv, "OPEN(%d), file %s: FD=%d, CNT=%d\n", i, demux_dev,
-                       priv->demux_fds[i], priv->demux_fds_cnt);
-            priv->demux_fds_cnt++;
+                       state->demux_fds[i], state->demux_fds_cnt);
+            state->demux_fds_cnt++;
         }
     }
 
-
-    priv->dvr_fd = open(dvr_dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (priv->dvr_fd < 0) {
+    state->dvr_fd = open(dvr_dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (state->dvr_fd < 0) {
         MP_ERR(priv, "ERROR OPENING DVR DEVICE %s: %d\n", dvr_dev, errno);
         return 0;
     }
@@ -113,29 +212,32 @@ int dvb_open_devices(dvb_priv_t *priv, int n, int demux_cnt)
 }
 
 
-int dvb_fix_demuxes(dvb_priv_t *priv, int cnt)
+int dvb_fix_demuxes(dvb_priv_t *priv, unsigned int cnt)
 {
     int i;
-    char demux_dev[32];
+    char demux_dev[PATH_MAX];
 
-    sprintf(demux_dev, "/dev/dvb/adapter%d/demux0", priv->card);
-    MP_VERBOSE(priv, "FIX %d -> %d\n", priv->demux_fds_cnt, cnt);
-    if (priv->demux_fds_cnt >= cnt) {
-        for (i = priv->demux_fds_cnt - 1; i >= cnt; i--) {
-            MP_VERBOSE(priv, "FIX, CLOSE fd(%d): %d\n", i, priv->demux_fds[i]);
-            close(priv->demux_fds[i]);
+    dvb_state_t* state = priv->state;
+
+    snprintf(demux_dev, sizeof(demux_dev), "/dev/dvb/adapter%d/demux0",
+            state->adapters[state->cur_adapter].devno);
+    MP_VERBOSE(priv, "FIX %d -> %d\n", state->demux_fds_cnt, cnt);
+    if (state->demux_fds_cnt >= cnt) {
+        for (i = state->demux_fds_cnt - 1; i >= (int)cnt; i--) {
+            MP_VERBOSE(priv, "FIX, CLOSE fd(%d): %d\n", i, state->demux_fds[i]);
+            close(state->demux_fds[i]);
         }
-        priv->demux_fds_cnt = cnt;
-    } else if (priv->demux_fds_cnt < cnt) {
-        for (i = priv->demux_fds_cnt; i < cnt; i++) {
-            priv->demux_fds[i] = open(demux_dev,
+        state->demux_fds_cnt = cnt;
+    } else {
+        for (i = state->demux_fds_cnt; i < cnt; i++) {
+            state->demux_fds[i] = open(demux_dev,
                                       O_RDWR | O_NONBLOCK | O_CLOEXEC);
-            MP_VERBOSE(priv, "FIX, OPEN fd(%d): %d\n", i, priv->demux_fds[i]);
-            if (priv->demux_fds[i] < 0) {
+            MP_VERBOSE(priv, "FIX, OPEN fd(%d): %d\n", i, state->demux_fds[i]);
+            if (state->demux_fds[i] < 0) {
                 MP_ERR(priv, "ERROR OPENING DEMUX 0: %d\n", errno);
                 return 0;
             } else
-                priv->demux_fds_cnt++;
+                state->demux_fds_cnt++;
         }
     }
 
@@ -155,7 +257,7 @@ int dvb_set_ts_filt(dvb_priv_t *priv, int fd, uint16_t pid,
     pesFilterParams.flags   = DMX_IMMEDIATE_START;
 
     {
-        int buffersize = 64 * 1024;
+        int buffersize = 256 * 1024;
         if (ioctl(fd, DMX_SET_BUFFER_SIZE, buffersize) < 0)
             MP_ERR(priv, "ERROR IN DMX_SET_BUFFER_SIZE %i for fd %d: ERRNO: %d\n",
                    pid, fd, errno);
@@ -173,16 +275,16 @@ int dvb_set_ts_filt(dvb_priv_t *priv, int fd, uint16_t pid,
     return 1;
 }
 
-int dvb_get_pmt_pid(dvb_priv_t *priv, int card, int service_id)
+int dvb_get_pmt_pid(dvb_priv_t *priv, int devno, int service_id)
 {
     /* We need special filters on the demux,
        so open one locally, and close also here. */
-    char demux_dev[32];
-    sprintf(demux_dev, "/dev/dvb/adapter%d/demux0", card);
+    char demux_dev[PATH_MAX];
+    snprintf(demux_dev, sizeof(demux_dev), "/dev/dvb/adapter%d/demux0", devno);
 
     struct dmx_sct_filter_params fparams;
 
-    memset(&fparams, 0, sizeof(fparams));
+    memset(&fparams, 0x00, sizeof(fparams));
     fparams.pid = 0;
     fparams.filter.filter[0] = 0x00;
     fparams.filter.mask[0] = 0xff;
@@ -195,7 +297,7 @@ int dvb_get_pmt_pid(dvb_priv_t *priv, int card, int service_id)
         return -1;
     }
 
-    if (ioctl(pat_fd, DMX_SET_FILTER, &fparams) == -1) {
+    if (ioctl(pat_fd, DMX_SET_FILTER, &fparams) < 0) {
         MP_ERR(priv, "ioctl DMX_SET_FILTER failed, error: %d", errno);
         close(pat_fd);
         return -1;
@@ -242,16 +344,6 @@ int dvb_get_pmt_pid(dvb_priv_t *priv, int card, int service_id)
     close(pat_fd);
 
     return pmt_pid;
-}
-
-int dvb_demux_stop(int fd)
-{
-    return ioctl(fd, DMX_STOP) == 0;
-}
-
-int dvb_demux_start(int fd)
-{
-    return ioctl(fd, DMX_START) == 0;
 }
 
 static void print_status(dvb_priv_t *priv, fe_status_t festatus)
@@ -335,20 +427,21 @@ struct diseqc_cmd {
 static int diseqc_send_msg(int fd, fe_sec_voltage_t v, struct diseqc_cmd *cmd,
                            fe_sec_tone_mode_t t, fe_sec_mini_cmd_t b)
 {
-    if (ioctl(fd, FE_SET_TONE, SEC_TONE_OFF) == -1)
+    if (ioctl(fd, FE_SET_TONE, SEC_TONE_OFF) < 0)
         return -1;
-    if (ioctl(fd, FE_SET_VOLTAGE, v) == -1)
+    if (ioctl(fd, FE_SET_VOLTAGE, v) < 0)
         return -1;
     usleep(15 * 1000);
-    if (ioctl(fd, FE_DISEQC_SEND_MASTER_CMD, &cmd->cmd) == -1)
+    if (ioctl(fd, FE_DISEQC_SEND_MASTER_CMD, &cmd->cmd) < 0)
         return -1;
     usleep(cmd->wait * 1000);
     usleep(15 * 1000);
-    if (ioctl(fd, FE_DISEQC_SEND_BURST, b) == -1)
+    if (ioctl(fd, FE_DISEQC_SEND_BURST, b) < 0)
         return -1;
     usleep(15 * 1000);
-    if (ioctl(fd, FE_SET_TONE, t) == -1)
+    if (ioctl(fd, FE_SET_TONE, t) < 0)
         return -1;
+    usleep(100000);
 
     return 0;
 }
@@ -367,12 +460,32 @@ static int do_diseqc(int secfd, int sat_no, int polv, int hi_lo)
 
     return diseqc_send_msg(secfd, polv ? SEC_VOLTAGE_13 : SEC_VOLTAGE_18,
                            &cmd, hi_lo ? SEC_TONE_ON : SEC_TONE_OFF,
-                           (sat_no / 4) % 2 ? SEC_MINI_B : SEC_MINI_A);
+                           ((sat_no / 4) % 2) ? SEC_MINI_B : SEC_MINI_A);
 }
 
-static int tune_it(dvb_priv_t *priv, int fd_frontend, int fd_sec,
-                   unsigned int freq, unsigned int srate, char pol, int tone,
-                   bool is_dvb_s2, int stream_id,
+#ifdef DVB_USE_S2API
+static int dvbv5_tune(dvb_priv_t *priv, int fd_frontend,
+                       unsigned int delsys, struct dtv_properties* cmdseq)
+{
+    MP_VERBOSE(priv, "Tuning via S2API, channel is %s.\n",
+               get_dvb_delsys(delsys));
+    MP_VERBOSE(priv, "Dumping raw tuning commands and values:\n");
+    for (int i = 0; i < cmdseq->num; ++i) {
+        MP_VERBOSE(priv, "%02d: 0x%x(%d) => 0x%x(%d)\n",
+                   i, cmdseq->props[i].cmd, cmdseq->props[i].cmd,
+                   cmdseq->props[i].u.data, cmdseq->props[i].u.data);
+    }
+    if (ioctl(fd_frontend, FE_SET_PROPERTY, cmdseq) < 0) {
+        MP_ERR(priv, "ERROR tuning channel\n");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+static int tune_it(dvb_priv_t *priv, int fd_frontend, unsigned int delsys,
+                   unsigned int freq, unsigned int srate, char pol,
+                   int stream_id,
                    fe_spectral_inversion_t specInv, unsigned int diseqc,
                    fe_modulation_t modulation,
                    fe_code_rate_t HP_CodeRate,
@@ -382,151 +495,111 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, int fd_sec,
                    fe_code_rate_t LP_CodeRate, fe_hierarchy_t hier,
                    int timeout)
 {
-    int hi_lo = 0, dfd;
+    int hi_lo = 0, bandwidth_hz = 0;
+    dvb_state_t* state = priv->state;
     struct dvb_frontend_parameters feparams;
-    struct dvb_frontend_info fe_info;
 
-    MP_VERBOSE(priv, "TUNE_IT, fd_frontend %d, fd_sec %d\nfreq %lu, srate %lu, "
-               "pol %c, tone %i, diseqc %u\n", fd_frontend, fd_sec,
-               (long unsigned int)freq, (long unsigned int)srate, pol,
-               tone, diseqc);
 
-    memset(&feparams, 0, sizeof(feparams));
-    if (ioctl(fd_frontend, FE_GET_INFO, &fe_info) < 0) {
-        MP_FATAL(priv, "FE_GET_INFO FAILED\n");
-        return -1;
-    }
+    MP_VERBOSE(priv, "TUNE_IT, fd_frontend %d, %s freq %lu, srate %lu, "
+               "pol %c, diseqc %u\n", fd_frontend,
+               get_dvb_delsys(delsys),
+               (long unsigned int)freq, (long unsigned int)srate,
+               (pol > ' ' ? pol : '-'), diseqc);
 
-    MP_VERBOSE(priv, "Using DVB card \"%s\"\n", fe_info.name);
+    MP_VERBOSE(priv, "Using %s adapter %d\n",
+        get_dvb_delsys(delsys),
+        state->adapters[state->cur_adapter].devno);
 
     {
         /* discard stale QPSK events */
         struct dvb_frontend_event ev;
         while (true) {
-            if (ioctl(fd_frontend, FE_GET_EVENT, &ev) == -1)
+            if (ioctl(fd_frontend, FE_GET_EVENT, &ev) < 0)
                 break;
         }
     }
 
-    switch (fe_info.type) {
-    case FE_OFDM:
+   /* Prepare params, be verbose. */
+    switch (delsys) {
+    case SYS_DVBT2:
+#ifndef DVB_USE_S2API
+        MP_ERR(priv, "ERROR: Can not tune to T2 channel, S2-API not "
+                     "available, will tune to DVB-T!\n");
+#endif
+        /* PASSTROUTH. */
+    case SYS_DVBT:
         if (freq < 1000000)
             freq *= 1000UL;
-        feparams.frequency = freq;
-        feparams.inversion = specInv;
-        feparams.u.ofdm.bandwidth = bandwidth;
-        feparams.u.ofdm.code_rate_HP = HP_CodeRate;
-        feparams.u.ofdm.code_rate_LP = LP_CodeRate;
-        feparams.u.ofdm.constellation = modulation;
-        feparams.u.ofdm.transmission_mode = TransmissionMode;
-        feparams.u.ofdm.guard_interval = guardInterval;
-        feparams.u.ofdm.hierarchy_information = hier;
-        MP_VERBOSE(priv, "tuning DVB-T to %d Hz, bandwidth: %d\n",
-                   freq, bandwidth);
-        if (ioctl(fd_frontend, FE_SET_FRONTEND, &feparams) < 0) {
-            MP_ERR(priv, "ERROR tuning channel\n");
-            return -1;
+        switch (bandwidth) {
+        case BANDWIDTH_5_MHZ:
+            bandwidth_hz = 5000000;
+            break;
+        case BANDWIDTH_6_MHZ:
+            bandwidth_hz = 6000000;
+            break;
+        case BANDWIDTH_7_MHZ:
+            bandwidth_hz = 7000000;
+            break;
+        case BANDWIDTH_8_MHZ:
+            bandwidth_hz = 8000000;
+            break;
+        case BANDWIDTH_10_MHZ:
+            bandwidth_hz = 10000000;
+            break;
+        case BANDWIDTH_AUTO:
+            if (freq < 474000000) {
+                bandwidth_hz = 7000000;
+            } else {
+                bandwidth_hz = 8000000;
+            }
+            break;
+        default:
+            bandwidth_hz = 0;
+            break;
         }
+
+        MP_VERBOSE(priv, "tuning %s to %d Hz, bandwidth: %d\n",
+                   get_dvb_delsys(delsys), freq, bandwidth_hz);
         break;
-    case FE_QPSK:
-        // DVB-S
+    case SYS_DVBS2:
+#ifndef DVB_USE_S2API
+        MP_ERR(priv, "ERROR: Can not tune to S2 channel, S2-API not "
+                     "available, will tune to DVB-S!\n");
+#endif
+        /* PASSTROUTH. */
+    case SYS_DVBS:
         if (freq > 2200000) {
             // this must be an absolute frequency
             if (freq < SLOF) {
-                freq = feparams.frequency = (freq - LOF1);
+                freq -= LOF1;
                 hi_lo = 0;
             } else {
-                freq = feparams.frequency = (freq - LOF2);
+                freq -= LOF2;
                 hi_lo = 1;
             }
-        } else {
-            // this is an L-Band frequency
-            feparams.frequency = freq;
         }
-
-        feparams.inversion = specInv;
-        feparams.u.qpsk.symbol_rate = srate;
-        feparams.u.qpsk.fec_inner = HP_CodeRate;
-        dfd = fd_frontend;
-
-        MP_VERBOSE(priv, "tuning DVB-S%sto Freq: %u, Pol: %c Srate: %d, "
-                   "22kHz: %s, LNB:  %d\n", is_dvb_s2 ? "2 " : " ", freq,
+        MP_VERBOSE(priv, "tuning %s to Freq: %u, Pol: %c Srate: %d, "
+                   "22kHz: %s, LNB:  %d\n", get_dvb_delsys(delsys), freq,
                    pol, srate, hi_lo ? "on" : "off", diseqc);
 
-        if (do_diseqc(dfd, diseqc, (pol == 'V' ? 1 : 0), hi_lo) == 0) {
+        if (do_diseqc(fd_frontend, diseqc, (pol == 'V' ? 1 : 0), hi_lo) == 0) {
             MP_VERBOSE(priv, "DISEQC setting succeeded\n");
         } else {
             MP_ERR(priv, "DISEQC setting failed\n");
             return -1;
         }
-        usleep(100000);
 
-#ifdef DVB_USE_S2API
-        /* S2API is the DVB API new since 2.6.28.
-         * It is needed to tune to new delivery systems, e.g. DVB-S2.
-         * It takes a struct with a list of pairs of command + parameter.
-         */
-
-        fe_delivery_system_t delsys = SYS_DVBS;
-        if (is_dvb_s2)
-            delsys = SYS_DVBS2;
-        fe_rolloff_t rolloff = ROLLOFF_AUTO;
-
-        struct dtv_property p[] = {
-            { .cmd = DTV_DELIVERY_SYSTEM, .u.data = delsys },
-            { .cmd = DTV_FREQUENCY, .u.data = freq },
-            { .cmd = DTV_MODULATION, .u.data = modulation },
-            { .cmd = DTV_SYMBOL_RATE, .u.data = srate },
-            { .cmd = DTV_INNER_FEC, .u.data = HP_CodeRate },
-            { .cmd = DTV_INVERSION, .u.data = specInv },
-            { .cmd = DTV_ROLLOFF, .u.data = rolloff },
-            { .cmd = DTV_PILOT, .u.data = PILOT_AUTO },
-            { .cmd = DTV_STREAM_ID, .u.data = stream_id },
-            { .cmd = DTV_TUNE },
-        };
-        struct dtv_properties cmdseq = {
-            .num = sizeof(p) / sizeof(p[0]),
-            .props = p
-        };
-        MP_VERBOSE(priv, "Tuning via S2API, channel is DVB-S%s.\n",
-                   is_dvb_s2 ? "2" : "");
-        if ((ioctl(fd_frontend, FE_SET_PROPERTY, &cmdseq)) == -1) {
-            MP_ERR(priv, "ERROR tuning channel\n");
-            return -1;
-        }
-#else
-        MP_VERBOSE(priv, "Tuning via DVB-API version 3.\n");
-        if (is_dvb_s2) {
-            MP_ERR(priv, "ERROR: Can not tune to S2 channel, S2-API not "
-                         "available, will tune to DVB-S!\n");
-        }
-        if (ioctl(fd_frontend, FE_SET_FRONTEND, &feparams) < 0) {
-            MP_ERR(priv, "ERROR tuning channel\n");
-            return -1;
-        }
-#endif
         break;
-    case FE_QAM:
-        feparams.frequency = freq;
-        feparams.inversion = specInv;
-        feparams.u.qam.symbol_rate = srate;
-        feparams.u.qam.fec_inner = HP_CodeRate;
-        feparams.u.qam.modulation = modulation;
-        MP_VERBOSE(priv, "tuning DVB-C to %d, srate=%d\n", freq, srate);
-        if (ioctl(fd_frontend, FE_SET_FRONTEND, &feparams) < 0) {
-            MP_ERR(priv, "ERROR tuning channel\n");
-            return -1;
-        }
+    case SYS_DVBC_ANNEX_A:
+    case SYS_DVBC_ANNEX_C:
+        MP_VERBOSE(priv, "tuning %s to %d, srate=%d\n",
+                   get_dvb_delsys(delsys), freq, srate);
         break;
 #ifdef DVB_ATSC
-    case FE_ATSC:
-        feparams.frequency = freq;
-        feparams.u.vsb.modulation = modulation;
-        MP_VERBOSE(priv, "tuning ATSC to %d, modulation=%d\n", freq, modulation);
-        if (ioctl(fd_frontend, FE_SET_FRONTEND, &feparams) < 0) {
-            MP_ERR(priv, "ERROR tuning channel\n");
-            return -1;
-        }
+    case SYS_ATSC:
+    case SYS_DVBC_ANNEX_B:
+        MP_VERBOSE(priv, "tuning %s to %d, modulation=%d\n",
+                   get_dvb_delsys(delsys), freq, modulation);
         break;
 #endif
     default:
@@ -534,22 +607,198 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, int fd_sec,
         return 0;
     }
 
+#ifdef DVB_USE_S2API
+    /* S2API is the DVB API new since 2.6.28.
+     * It is needed to tune to new delivery systems, e.g. DVB-S2.
+     * It takes a struct with a list of pairs of command + parameter.
+     */
+
+    /* Reset before tune. */
+    struct dtv_property p_clear[] = {
+        { .cmd = DTV_CLEAR },
+    };
+    struct dtv_properties cmdseq_clear = {
+        .num = 1,
+        .props = p_clear
+    };
+    if (ioctl(fd_frontend, FE_SET_PROPERTY, &cmdseq_clear) < 0) {
+        MP_ERR(priv, "FE_SET_PROPERTY DTV_CLEAR failed\n");
+    }
+
+    /* Tune. */
+    switch (delsys) {
+    case SYS_DVBS:
+    case SYS_DVBS2:
+        {
+            struct dtv_property p[] = {
+                { .cmd = DTV_DELIVERY_SYSTEM, .u.data = delsys },
+                { .cmd = DTV_FREQUENCY, .u.data = freq },
+                { .cmd = DTV_MODULATION, .u.data = modulation },
+                { .cmd = DTV_SYMBOL_RATE, .u.data = srate },
+                { .cmd = DTV_INNER_FEC, .u.data = HP_CodeRate },
+                { .cmd = DTV_INVERSION, .u.data = specInv },
+                { .cmd = DTV_ROLLOFF, .u.data = ROLLOFF_AUTO },
+                { .cmd = DTV_PILOT, .u.data = PILOT_AUTO },
+                { .cmd = DTV_TUNE },
+            };
+            struct dtv_properties cmdseq = {
+                .num = sizeof(p) / sizeof(p[0]),
+                .props = p
+            };
+            if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
+                goto old_api;
+            }
+        }
+        break;
+    case SYS_DVBT:
+    case SYS_DVBT2:
+        {
+            struct dtv_property p[] = {
+                { .cmd = DTV_DELIVERY_SYSTEM, .u.data = delsys },
+                { .cmd = DTV_FREQUENCY, .u.data = freq },
+                { .cmd = DTV_MODULATION, .u.data = modulation },
+                { .cmd = DTV_SYMBOL_RATE, .u.data = srate },
+                { .cmd = DTV_CODE_RATE_HP, .u.data = HP_CodeRate },
+                { .cmd = DTV_CODE_RATE_LP, .u.data = LP_CodeRate },
+                { .cmd = DTV_INVERSION, .u.data = specInv },
+                { .cmd = DTV_BANDWIDTH_HZ, .u.data = bandwidth_hz },
+                { .cmd = DTV_TRANSMISSION_MODE, .u.data = TransmissionMode },
+                { .cmd = DTV_GUARD_INTERVAL, .u.data = guardInterval },
+                { .cmd = DTV_HIERARCHY, .u.data = hier },
+                { .cmd = DTV_STREAM_ID, .u.data = stream_id },
+                { .cmd = DTV_TUNE },
+            };
+            struct dtv_properties cmdseq = {
+                .num = sizeof(p) / sizeof(p[0]),
+                .props = p
+            };
+            if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
+                goto old_api;
+            }
+        }
+        break;
+    case SYS_DVBC_ANNEX_A:
+    case SYS_DVBC_ANNEX_C:
+        {
+            struct dtv_property p[] = {
+                { .cmd = DTV_DELIVERY_SYSTEM, .u.data = delsys },
+                { .cmd = DTV_FREQUENCY, .u.data = freq },
+                { .cmd = DTV_MODULATION, .u.data = modulation },
+                { .cmd = DTV_SYMBOL_RATE, .u.data = srate },
+                { .cmd = DTV_INNER_FEC, .u.data = HP_CodeRate },
+                { .cmd = DTV_INVERSION, .u.data = specInv },
+                { .cmd = DTV_TUNE },
+            };
+            struct dtv_properties cmdseq = {
+                .num = sizeof(p) / sizeof(p[0]),
+                .props = p
+            };
+            if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
+                goto old_api;
+            }
+        }
+        break;
+#ifdef DVB_ATSC
+    case SYS_ATSC:
+    case SYS_DVBC_ANNEX_B:
+        {
+            struct dtv_property p[] = {
+                { .cmd = DTV_DELIVERY_SYSTEM, .u.data = delsys },
+                { .cmd = DTV_FREQUENCY, .u.data = freq },
+                { .cmd = DTV_INVERSION, .u.data = specInv },
+                { .cmd = DTV_MODULATION, .u.data = modulation },
+                { .cmd = DTV_TUNE },
+            };
+            struct dtv_properties cmdseq = {
+                .num = sizeof(p) / sizeof(p[0]),
+                .props = p
+            };
+            if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
+                goto old_api;
+            }
+        }
+        break;
+#endif
+    }
+
+    int tune_status = check_status(priv, fd_frontend, timeout);
+    if (tune_status != 0) {
+        MP_ERR(priv, "ERROR locking to channel when tuning with S2API, clearing and falling back to DVBv3-tuning.\n");
+        if (ioctl(fd_frontend, FE_SET_PROPERTY, &cmdseq_clear) < 0) {
+            MP_ERR(priv, "FE_SET_PROPERTY DTV_CLEAR failed\n");
+        }
+        goto old_api;
+    } else {
+        return tune_status;
+    }
+
+old_api:
+#endif
+
+    MP_VERBOSE(priv, "Tuning via DVB-API version 3.\n");
+
+    if (stream_id != NO_STREAM_ID_FILTER && stream_id != 0) {
+        MP_ERR(priv, "DVB-API version 3 does not support stream_id (PLP).\n");
+        return -1;
+    }
+    memset(&feparams, 0x00, sizeof(feparams));
+    feparams.frequency = freq;
+    feparams.inversion = specInv;
+
+    switch (delsys) {
+    case SYS_DVBT:
+    case SYS_DVBT2:
+        feparams.u.ofdm.bandwidth = bandwidth;
+        feparams.u.ofdm.code_rate_HP = HP_CodeRate;
+        feparams.u.ofdm.code_rate_LP = LP_CodeRate;
+        feparams.u.ofdm.constellation = modulation;
+        feparams.u.ofdm.transmission_mode = TransmissionMode;
+        feparams.u.ofdm.guard_interval = guardInterval;
+        feparams.u.ofdm.hierarchy_information = hier;
+        break;
+    case SYS_DVBS:
+    case SYS_DVBS2:
+        feparams.u.qpsk.symbol_rate = srate;
+        feparams.u.qpsk.fec_inner = HP_CodeRate;
+        break;
+    case SYS_DVBC_ANNEX_A:
+    case SYS_DVBC_ANNEX_C:
+        feparams.u.qam.symbol_rate = srate;
+        feparams.u.qam.fec_inner = HP_CodeRate;
+        feparams.u.qam.modulation = modulation;
+        break;
+#ifdef DVB_ATSC
+    case SYS_ATSC:
+    case SYS_DVBC_ANNEX_B:
+        feparams.u.vsb.modulation = modulation;
+        break;
+#endif
+    }
+
+    if (ioctl(fd_frontend, FE_SET_FRONTEND, &feparams) < 0) {
+        MP_ERR(priv, "ERROR tuning channel\n");
+        return -1;
+    }
+
     return check_status(priv, fd_frontend, timeout);
 }
 
-int dvb_tune(dvb_priv_t *priv, int freq, char pol, int srate, int diseqc,
-             int tone,
-             bool is_dvb_s2, int stream_id, fe_spectral_inversion_t specInv,
+int dvb_tune(dvb_priv_t *priv, unsigned int delsys,
+             int freq, char pol, int srate, int diseqc,
+             int stream_id, fe_spectral_inversion_t specInv,
              fe_modulation_t modulation, fe_guard_interval_t guardInterval,
              fe_transmit_mode_t TransmissionMode, fe_bandwidth_t bandWidth,
              fe_code_rate_t HP_CodeRate,
              fe_code_rate_t LP_CodeRate, fe_hierarchy_t hier,
              int timeout)
 {
-    MP_INFO(priv, "dvb_tune Freq: %lu\n", (long unsigned int) freq);
+    MP_INFO(priv, "dvb_tune %s Freq: %lu\n",
+            get_dvb_delsys(delsys), (long unsigned int) freq);
 
-    int ris = tune_it(priv, priv->fe_fd, priv->sec_fd, freq, srate, pol, tone,
-                      is_dvb_s2, stream_id, specInv, diseqc, modulation,
+    dvb_state_t* state = priv->state;
+
+    int ris = tune_it(priv, state->fe_fd, delsys, freq, srate, pol,
+                      stream_id, specInv, diseqc, modulation,
                       HP_CodeRate, TransmissionMode, guardInterval,
                       bandWidth, LP_CodeRate, hier, timeout);
 

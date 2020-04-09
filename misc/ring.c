@@ -3,42 +3,42 @@
  * Copyright (c) 2012 wm4
  * Copyright (c) 2013 Stefano Pigozzi <stefano.pigozzi@gmail.com>
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <inttypes.h>
 #include <libavutil/common.h>
 #include <assert.h>
-#include "talloc.h"
-#include "osdep/atomics.h"
+#include "mpv_talloc.h"
+#include "osdep/atomic.h"
 #include "ring.h"
 
 struct mp_ring {
     uint8_t  *buffer;
 
-    /* Positions of the first readable/writeable chunks. Do not read this
-     * fields but use the atomic private accessors `mp_ring_get_wpos`
+    /* Positions of the first readable/writeable chunks. Do not read these
+     * fields. Use the atomic private accessors `mp_ring_get_wpos`
      * and `mp_ring_get_rpos`. */
-    atomic_ulong rpos, wpos;
+    atomic_ullong rpos, wpos;
 };
 
-static unsigned long mp_ring_get_wpos(struct mp_ring *buffer)
+static unsigned long long mp_ring_get_wpos(struct mp_ring *buffer)
 {
     return atomic_load(&buffer->wpos);
 }
 
-static unsigned long mp_ring_get_rpos(struct mp_ring *buffer)
+static unsigned long long mp_ring_get_rpos(struct mp_ring *buffer)
 {
     return atomic_load(&buffer->rpos);
 }

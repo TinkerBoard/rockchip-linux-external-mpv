@@ -33,26 +33,81 @@
 #include "ao.h"
 #include "internal.h"
 #include "audio/format.h"
+#include "osdep/atomic.h"
 #include "osdep/timer.h"
+#include "options/m_config.h"
 #include "options/m_option.h"
 
 #include <jack/jack.h>
 
-struct priv {
-    jack_client_t *client;
-    float jack_latency;
-    char *cfg_port;
-    char *cfg_client_name;
+#if !HAVE_GPL
+#error GPL only
+#endif
+
+struct jack_opts {
+    char *port;
+    char *client_name;
     int connect;
     int autostart;
     int stdlayout;
+};
+
+#define OPT_BASE_STRUCT struct jack_opts
+static const struct m_sub_options ao_jack_conf = {
+    .opts = (const struct m_option[]){
+        OPT_STRING("jack-port", port, 0),
+        OPT_STRING("jack-name", client_name, 0),
+        OPT_FLAG("jack-autostart", autostart, 0),
+        OPT_FLAG("jack-connect", connect, 0),
+        OPT_CHOICE("jack-std-channel-layout", stdlayout, 0,
+                   ({"waveext", 0}, {"any", 1})),
+        {0}
+    },
+    .defaults = &(const struct jack_opts) {
+        .client_name = "mpv",
+        .connect = 1,
+    },
+    .size = sizeof(struct jack_opts),
+};
+
+struct priv {
+    jack_client_t *client;
+
+    atomic_uint graph_latency_max;
+    atomic_uint buffer_size;
+
     int last_chunk;
 
     int num_ports;
     jack_port_t *ports[MP_NUM_CHANNELS];
 
     int activated;
+
+    struct jack_opts *opts;
 };
+
+static int graph_order_cb(void *arg)
+{
+    struct ao *ao = arg;
+    struct priv *p = ao->priv;
+
+    jack_latency_range_t jack_latency_range;
+    jack_port_get_latency_range(p->ports[0], JackPlaybackLatency,
+                                &jack_latency_range);
+    atomic_store(&p->graph_latency_max, jack_latency_range.max);
+
+    return 0;
+}
+
+static int buffer_size_cb(jack_nframes_t nframes, void *arg)
+{
+    struct ao *ao = arg;
+    struct priv *p = ao->priv;
+
+    atomic_store(&p->buffer_size, nframes);
+
+    return 0;
+}
 
 static int process(jack_nframes_t nframes, void *arg)
 {
@@ -64,8 +119,11 @@ static int process(jack_nframes_t nframes, void *arg)
     for (int i = 0; i < p->num_ports; i++)
         buffers[i] = jack_port_get_buffer(p->ports[i], nframes);
 
+    jack_nframes_t jack_latency =
+        atomic_load(&p->graph_latency_max) + atomic_load(&p->buffer_size);
+
     int64_t end_time = mp_time_us();
-    end_time += (p->jack_latency + nframes / (double)ao->samplerate) * 1000000.0;
+    end_time += (jack_latency + nframes) / (double)ao->samplerate * 1000000.0;
 
     ao_read_data(ao, buffers, nframes, end_time);
 
@@ -77,7 +135,7 @@ connect_to_outports(struct ao *ao)
 {
     struct priv *p = ao->priv;
 
-    char *port_name = (p->cfg_port && p->cfg_port[0]) ? p->cfg_port : NULL;
+    char *port_name = (p->opts->port && p->opts->port[0]) ? p->opts->port : NULL;
     const char **matching_ports = NULL;
     int port_flags = JackPortIsInput;
     int i;
@@ -85,7 +143,8 @@ connect_to_outports(struct ao *ao)
     if (!port_name)
         port_flags |= JackPortIsPhysical;
 
-    matching_ports = jack_get_ports(p->client, port_name, NULL, port_flags);
+    const char *port_type = JACK_DEFAULT_AUDIO_TYPE; // exclude MIDI ports
+    matching_ports = jack_get_ports(p->client, port_name, port_type, port_flags);
 
     if (!matching_ports || !matching_ports[0]) {
         MP_FATAL(ao, "no ports to connect to\n");
@@ -144,7 +203,7 @@ static void resume(struct ao *ao)
         if (jack_activate(p->client))
             MP_FATAL(ao, "activate failed\n");
 
-        if (p->connect)
+        if (p->opts->connect)
             connect_to_outports(ao);
     }
 }
@@ -155,15 +214,13 @@ static int init(struct ao *ao)
     struct mp_chmap_sel sel = {0};
     jack_options_t open_options;
 
+    p->opts = mp_get_config_group(ao, ao->global, &ao_jack_conf);
+
     ao->format = AF_FORMAT_FLOATP;
 
-    switch (p->stdlayout) {
+    switch (p->opts->stdlayout) {
     case 0:
         mp_chmap_sel_add_waveext(&sel);
-        break;
-
-    case 1:
-        mp_chmap_sel_add_alsa_def(&sel);
         break;
 
     default:
@@ -174,10 +231,10 @@ static int init(struct ao *ao)
         goto err_chmap;
 
     open_options = JackNullOption;
-    if (!p->autostart)
+    if (!p->opts->autostart)
         open_options |= JackNoStartServer;
 
-    p->client = jack_client_open(p->cfg_client_name, open_options, NULL);
+    p->client = jack_client_open(p->opts->client_name, open_options, NULL);
     if (!p->client) {
         MP_FATAL(ao, "cannot open server\n");
         goto err_client_open;
@@ -190,11 +247,8 @@ static int init(struct ao *ao)
 
     ao->samplerate = jack_get_sample_rate(p->client);
 
-    jack_latency_range_t jack_latency_range;
-    jack_port_get_latency_range(p->ports[0], JackPlaybackLatency,
-                                &jack_latency_range);
-    p->jack_latency = (float)(jack_latency_range.max + jack_get_buffer_size(p->client))
-                      / (float)ao->samplerate;
+    jack_set_buffer_size_callback(p->client, buffer_size_cb, ao);
+    jack_set_graph_order_callback(p->client, graph_order_cb, ao);
 
     if (!ao_chmap_sel_get_def(ao, &sel, &ao->channels, p->num_ports))
         goto err_chmap_sel_get_def;
@@ -217,8 +271,6 @@ static void uninit(struct ao *ao)
     jack_client_close(p->client);
 }
 
-#define OPT_BASE_STRUCT struct priv
-
 const struct ao_driver audio_out_jack = {
     .description = "JACK audio output",
     .name        = "jack",
@@ -226,17 +278,5 @@ const struct ao_driver audio_out_jack = {
     .uninit    = uninit,
     .resume    = resume,
     .priv_size = sizeof(struct priv),
-    .priv_defaults = &(const struct priv) {
-        .cfg_client_name = "mpv",
-        .connect = 1,
-    },
-    .options = (const struct m_option[]) {
-        OPT_STRING("port", cfg_port, 0),
-        OPT_STRING("name", cfg_client_name, 0),
-        OPT_FLAG("autostart", autostart, 0),
-        OPT_FLAG("connect", connect, 0),
-        OPT_CHOICE("std-channel-layout", stdlayout, 0,
-                ({"waveext", 0}, {"alsa", 1}, {"any", 2})),
-        {0}
-    },
+    .global_opts = &ao_jack_conf,
 };

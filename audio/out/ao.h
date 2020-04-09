@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_AUDIO_OUT_H
@@ -48,6 +48,19 @@ enum aocontrol {
 enum {
     AO_EVENT_RELOAD = 1,
     AO_EVENT_HOTPLUG = 2,
+    AO_EVENT_INITIAL_UNBLOCK = 4,
+};
+
+enum {
+    // Allow falling back to ao_null if nothing else works.
+    AO_INIT_NULL_FALLBACK = 1 << 0,
+    // Only accept multichannel configurations that are guaranteed to work
+    // (i.e. not sending arbitrary layouts over HDMI).
+    AO_INIT_SAFE_MULTICHANNEL_ONLY = 1 << 1,
+    // Stream silence as long as no audio is playing.
+    AO_INIT_STREAM_SILENCE = 1 << 2,
+    // Force exclusive mode, i.e. lock out the system mixer.
+    AO_INIT_EXCLUSIVE = 1 << 3,
 };
 
 typedef struct ao_control_vol {
@@ -69,19 +82,21 @@ struct ao;
 struct mpv_global;
 struct input_ctx;
 struct encode_lavc_context;
-struct mp_audio;
 
 struct ao *ao_init_best(struct mpv_global *global,
-                        struct input_ctx *input_ctx,
+                        int init_flags,
+                        void (*wakeup_cb)(void *ctx), void *wakeup_ctx,
                         struct encode_lavc_context *encode_lavc_ctx,
                         int samplerate, int format, struct mp_chmap channels);
 void ao_uninit(struct ao *ao);
-void ao_get_format(struct ao *ao, struct mp_audio *format);
+void ao_get_format(struct ao *ao,
+                   int *samplerate, int *format, struct mp_chmap *channels);
 const char *ao_get_name(struct ao *ao);
 const char *ao_get_description(struct ao *ao);
 bool ao_untimed(struct ao *ao);
 int ao_play(struct ao *ao, void **data, int samples, int flags);
 int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
+void ao_set_gain(struct ao *ao, float gain);
 double ao_get_delay(struct ao *ao);
 int ao_get_space(struct ao *ao);
 void ao_reset(struct ao *ao);
@@ -90,15 +105,17 @@ void ao_resume(struct ao *ao);
 void ao_drain(struct ao *ao);
 bool ao_eof_reached(struct ao *ao);
 int ao_query_and_reset_events(struct ao *ao, int events);
+void ao_add_events(struct ao *ao, int events);
+void ao_unblock(struct ao *ao);
 void ao_request_reload(struct ao *ao);
 void ao_hotplug_event(struct ao *ao);
 
 struct ao_hotplug;
 struct ao_hotplug *ao_hotplug_create(struct mpv_global *global,
-                                     struct input_ctx *input_ctx);
+                                     void (*wakeup_cb)(void *ctx),
+                                     void *wakeup_ctx);
 void ao_hotplug_destroy(struct ao_hotplug *hp);
 bool ao_hotplug_check_update(struct ao_hotplug *hp);
-const char *ao_hotplug_get_detected_device(struct ao_hotplug *hp);
 struct ao_device_list *ao_hotplug_get_device_list(struct ao_hotplug *hp);
 
 void ao_print_devices(struct mpv_global *global, struct mp_log *log);

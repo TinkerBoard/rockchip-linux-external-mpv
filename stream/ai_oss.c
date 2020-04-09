@@ -25,15 +25,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 
-#if HAVE_SYS_SOUNDCARD_H
 #include <sys/soundcard.h>
-#else
-#if HAVE_SOUNDCARD_H
-#include <soundcard.h>
-#else
-#include <linux/soundcard.h>
-#endif
-#endif
 
 #include "osdep/io.h"
 
@@ -87,11 +79,14 @@ int ai_oss_init(audio_in_t *ai)
     int err;
     int ioctl_param;
 
-    ai->oss.audio_fd = open(ai->oss.device, O_RDONLY | O_CLOEXEC);
+    const char *device = ai->oss.device;
+    if (!device)
+        device = "/dev/dsp";
+
+    ai->oss.audio_fd = open(device, O_RDONLY | O_CLOEXEC);
     if (ai->oss.audio_fd < 0)
     {
-        MP_ERR(ai, "Unable to open '%s': %s\n",
-               ai->oss.device, mp_strerror(errno));
+        MP_ERR(ai, "Unable to open '%s': %s\n", device, mp_strerror(errno));
         return -1;
     }
 

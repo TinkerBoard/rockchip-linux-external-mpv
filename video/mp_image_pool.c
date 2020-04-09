@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "config.h"
@@ -22,11 +22,16 @@
 #include <pthread.h>
 #include <assert.h>
 
-#include "talloc.h"
+#include <libavutil/buffer.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/mem.h>
+
+#include "mpv_talloc.h"
 
 #include "common/common.h"
-#include "video/mp_image.h"
 
+#include "fmt-conversion.h"
+#include "mp_image.h"
 #include "mp_image_pool.h"
 
 static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -38,10 +43,10 @@ static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 // destructors are thread-safe.)
 
 struct mp_image_pool {
-    int max_count;
-
     struct mp_image **images;
     int num_images;
+
+    int fmt, w, h;
 
     mp_image_allocator allocator;
     void *allocator_ctx;
@@ -65,13 +70,12 @@ static void image_pool_destructor(void *ptr)
     mp_image_pool_clear(pool);
 }
 
-struct mp_image_pool *mp_image_pool_new(int max_count)
+// If tparent!=NULL, set it as talloc parent for the pool.
+struct mp_image_pool *mp_image_pool_new(void *tparent)
 {
-    struct mp_image_pool *pool = talloc_ptrtype(NULL, pool);
+    struct mp_image_pool *pool = talloc_ptrtype(tparent, pool);
     talloc_set_destructor(pool, image_pool_destructor);
-    *pool = (struct mp_image_pool) {
-        .max_count = max_count,
-    };
+    *pool = (struct mp_image_pool) {0};
     return pool;
 }
 
@@ -94,9 +98,9 @@ void mp_image_pool_clear(struct mp_image_pool *pool)
 
 // This is the only function that is allowed to run in a different thread.
 // (Consider passing an image to another thread, which frees it.)
-static void unref_image(void *ptr)
+static void unref_image(void *opaque, uint8_t *data)
 {
-    struct mp_image *img = ptr;
+    struct mp_image *img = opaque;
     struct image_flags *it = img->priv;
     bool alive;
     pool_lock();
@@ -135,11 +139,39 @@ struct mp_image *mp_image_pool_get_no_alloc(struct mp_image_pool *pool, int fmt,
     pool_unlock();
     if (!new)
         return NULL;
+
+    // Reference the new image. Since mp_image_pool is not declared thread-safe,
+    // and unreffing images from other threads does not allocate new images,
+    // no synchronization is required here.
+    for (int p = 0; p < MP_MAX_PLANES; p++)
+        assert(!!new->bufs[p] == !p); // only 1 AVBufferRef
+
+    struct mp_image *ref = mp_image_new_dummy_ref(new);
+
+    // This assumes the buffer is at this point exclusively owned by us: we
+    // can't track whether the buffer is unique otherwise.
+    // (av_buffer_is_writable() checks the refcount of the new buffer only.)
+    int flags = av_buffer_is_writable(new->bufs[0]) ? 0 : AV_BUFFER_FLAG_READONLY;
+    ref->bufs[0] = av_buffer_create(new->bufs[0]->data, new->bufs[0]->size,
+                                    unref_image, new, flags);
+    if (!ref->bufs[0]) {
+        talloc_free(ref);
+        return NULL;
+    }
+
     struct image_flags *it = new->priv;
     assert(!it->referenced && it->pool_alive);
     it->referenced = true;
     it->order = ++pool->lru_counter;
-    return mp_image_new_custom_ref(new, new, unref_image);
+    return ref;
+}
+
+void mp_image_pool_add(struct mp_image_pool *pool, struct mp_image *new)
+{
+    struct image_flags *it = talloc_ptrtype(new, it);
+    *it = (struct image_flags) { .pool_alive = true };
+    new->priv = it;
+    MP_TARRAY_APPEND(pool, pool->images, pool->num_images, new);
 }
 
 // Return a new image of given format/size. The only difference to
@@ -155,8 +187,11 @@ struct mp_image *mp_image_pool_get(struct mp_image_pool *pool, int fmt,
         return mp_image_alloc(fmt, w, h);
     struct mp_image *new = mp_image_pool_get_no_alloc(pool, fmt, w, h);
     if (!new) {
-        if (pool->num_images >= pool->max_count)
+        if (fmt != pool->fmt || w != pool->w || h != pool->h)
             mp_image_pool_clear(pool);
+        pool->fmt = fmt;
+        pool->w = w;
+        pool->h = h;
         if (pool->allocator) {
             new = pool->allocator(pool->allocator_ctx, fmt, w, h);
         } else {
@@ -164,10 +199,7 @@ struct mp_image *mp_image_pool_get(struct mp_image_pool *pool, int fmt,
         }
         if (!new)
             return NULL;
-        struct image_flags *it = talloc_ptrtype(new, it);
-        *it = (struct image_flags) { .pool_alive = true };
-        new->priv = it;
-        MP_TARRAY_APPEND(pool, pool->images, pool->num_images, new);
+        mp_image_pool_add(pool, new);
         new = mp_image_pool_get_no_alloc(pool, fmt, w, h);
     }
     return new;
@@ -204,6 +236,10 @@ bool mp_image_pool_make_writeable(struct mp_image_pool *pool,
     return true;
 }
 
+// Call cb(cb_data, fmt, w, h) to allocate an image. Note that the resulting
+// image must use only 1 AVBufferRef. The returned image must also be owned
+// exclusively by the image pool, otherwise mp_image_is_writeable() will not
+// work due to FFmpeg restrictions.
 void mp_image_pool_set_allocator(struct mp_image_pool *pool,
                                  mp_image_allocator cb, void  *cb_data)
 {
@@ -215,4 +251,169 @@ void mp_image_pool_set_allocator(struct mp_image_pool *pool,
 void mp_image_pool_set_lru(struct mp_image_pool *pool)
 {
     pool->use_lru = true;
+}
+
+
+// Copies the contents of the HW surface img to system memory and retuns it.
+// If swpool is not NULL, it's used to allocate the target image.
+// img must be a hw surface with a AVHWFramesContext attached.
+// The returned image is cropped as needed.
+// Returns NULL on failure.
+struct mp_image *mp_image_hw_download(struct mp_image *src,
+                                      struct mp_image_pool *swpool)
+{
+    if (!src->hwctx)
+        return NULL;
+    AVHWFramesContext *fctx = (void *)src->hwctx->data;
+
+    // Try to find the first format which we can apparently use.
+    int imgfmt = 0;
+    enum AVPixelFormat *fmts;
+    if (av_hwframe_transfer_get_formats(src->hwctx,
+            AV_HWFRAME_TRANSFER_DIRECTION_FROM, &fmts, 0) < 0)
+        return NULL;
+    for (int n = 0; fmts[n] != AV_PIX_FMT_NONE; n++) {
+        imgfmt = pixfmt2imgfmt(fmts[n]);
+        if (imgfmt)
+            break;
+    }
+    av_free(fmts);
+
+    if (!imgfmt)
+        return NULL;
+
+    struct mp_image *dst =
+        mp_image_pool_get(swpool, imgfmt, fctx->width, fctx->height);
+    if (!dst)
+        return NULL;
+
+    // Target image must be writable, so unref it.
+    AVFrame *dstav = mp_image_to_av_frame_and_unref(dst);
+    if (!dstav)
+        return NULL;
+
+    AVFrame *srcav = mp_image_to_av_frame(src);
+    if (!srcav) {
+        av_frame_unref(dstav);
+        return NULL;
+    }
+
+    int res = av_hwframe_transfer_data(dstav, srcav, 0);
+    av_frame_free(&srcav);
+    dst = mp_image_from_av_frame(dstav);
+    av_frame_free(&dstav);
+    if (res >= 0 && dst) {
+        mp_image_set_size(dst, src->w, src->h);
+        mp_image_copy_attributes(dst, src);
+    } else {
+        mp_image_unrefp(&dst);
+    }
+    return dst;
+}
+
+bool mp_image_hw_upload(struct mp_image *hw_img, struct mp_image *src)
+{
+    if (hw_img->w != src->w || hw_img->h != src->h)
+        return false;
+
+    if (!hw_img->hwctx || src->hwctx)
+        return false;
+
+    bool ok = false;
+    AVFrame *dstav = NULL;
+    AVFrame *srcav = NULL;
+
+    // This means the destination image will not be "writable", which would be
+    // a pain if Libav enforced this - fortunately it doesn't care. We can
+    // transfer data to it even if there are multiple refs.
+    dstav = mp_image_to_av_frame(hw_img);
+    if (!dstav)
+        goto done;
+
+    srcav = mp_image_to_av_frame(src);
+    if (!srcav)
+        goto done;
+
+    ok = av_hwframe_transfer_data(dstav, srcav, 0) >= 0;
+
+done:
+    av_frame_unref(srcav);
+    av_frame_unref(dstav);
+
+    if (ok)
+        mp_image_copy_attributes(hw_img, src);
+    return ok;
+}
+
+bool mp_update_av_hw_frames_pool(struct AVBufferRef **hw_frames_ctx,
+                                 struct AVBufferRef *hw_device_ctx,
+                                 int imgfmt, int sw_imgfmt, int w, int h)
+{
+    enum AVPixelFormat format = imgfmt2pixfmt(imgfmt);
+    enum AVPixelFormat sw_format = imgfmt2pixfmt(sw_imgfmt);
+
+    if (format == AV_PIX_FMT_NONE || sw_format == AV_PIX_FMT_NONE ||
+        !hw_device_ctx || w < 1 || h < 1)
+    {
+        av_buffer_unref(hw_frames_ctx);
+        return false;
+    }
+
+    if (*hw_frames_ctx) {
+        AVHWFramesContext *hw_frames = (void *)(*hw_frames_ctx)->data;
+
+        if (hw_frames->device_ref->data != hw_device_ctx->data ||
+            hw_frames->format != format || hw_frames->sw_format != sw_format ||
+            hw_frames->width != w || hw_frames->height != h)
+            av_buffer_unref(hw_frames_ctx);
+    }
+
+    if (!*hw_frames_ctx) {
+        *hw_frames_ctx = av_hwframe_ctx_alloc(hw_device_ctx);
+        if (!*hw_frames_ctx)
+            return false;
+
+        AVHWFramesContext *hw_frames = (void *)(*hw_frames_ctx)->data;
+        hw_frames->format = format;
+        hw_frames->sw_format = sw_format;
+        hw_frames->width = w;
+        hw_frames->height = h;
+        if (av_hwframe_ctx_init(*hw_frames_ctx) < 0) {
+            av_buffer_unref(hw_frames_ctx);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct mp_image *mp_av_pool_image_hw_upload(struct AVBufferRef *hw_frames_ctx,
+                                            struct mp_image *src)
+{
+    AVFrame *av_frame = av_frame_alloc();
+    if (!av_frame)
+        return NULL;
+    if (av_hwframe_get_buffer(hw_frames_ctx, av_frame, 0) < 0) {
+        av_frame_free(&av_frame);
+        return NULL;
+    }
+    struct mp_image *dst = mp_image_from_av_frame(av_frame);
+    av_frame_free(&av_frame);
+    if (!dst)
+        return NULL;
+
+    if (dst->w < src->w || dst->h < src->h) {
+        talloc_free(dst);
+        return NULL;
+    }
+
+    mp_image_set_size(dst, src->w, src->h);
+
+    if (!mp_image_hw_upload(dst, src)) {
+        talloc_free(dst);
+        return NULL;
+    }
+
+    mp_image_copy_attributes(dst, src);
+    return dst;
 }

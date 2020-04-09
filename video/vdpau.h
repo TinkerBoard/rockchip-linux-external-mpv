@@ -12,6 +12,11 @@
 #include "common/msg.h"
 #include "hwdec.h"
 
+#include "config.h"
+#if !HAVE_GPL
+#error GPL only
+#endif
+
 #define CHECK_VDP_ERROR_ST(ctx, message, statement) \
     do { \
         if (vdp_st != VDP_STATUS_OK) { \
@@ -22,6 +27,9 @@
 
 #define CHECK_VDP_ERROR(ctx, message) \
     CHECK_VDP_ERROR_ST(ctx, message, return -1;)
+
+#define CHECK_VDP_ERROR_NORETURN(ctx, message) \
+    CHECK_VDP_ERROR_ST(ctx, message, ;)
 
 #define CHECK_VDP_WARNING(ctx, message) \
     do { \
@@ -43,8 +51,10 @@ struct vdp_functions {
 struct mp_vdpau_ctx {
     struct mp_log *log;
     Display *x11;
+    bool close_display;
 
     struct mp_hwdec_ctx hwctx;
+    struct AVBufferRef *av_device_ref;
 
     // These are mostly immutable, except on preemption. We don't really care
     // to synchronize the preemption case fully correctly, because it's an
@@ -59,6 +69,7 @@ struct mp_vdpau_ctx {
     uint64_t preemption_counter;        // incremented after _restoring_
     bool preemption_user_notified;
     double last_preemption_retry_fail;
+    VdpOutputSurface preemption_obj;    // dummy for reliable preempt. check
 
     // Surface pool
     pthread_mutex_t pool_lock;
@@ -74,12 +85,10 @@ struct mp_vdpau_ctx {
         bool in_use;
         int64_t age;
     } video_surfaces[MAX_VIDEO_SURFACES];
-    struct mp_vdpau_mixer *getimg_mixer;
-    VdpOutputSurface getimg_surface;
-    int getimg_w, getimg_h;
 };
 
-struct mp_vdpau_ctx *mp_vdpau_create_device_x11(struct mp_log *log, Display *x11);
+struct mp_vdpau_ctx *mp_vdpau_create_device_x11(struct mp_log *log, Display *x11,
+                                                bool probing);
 void mp_vdpau_destroy(struct mp_vdpau_ctx *ctx);
 
 int mp_vdpau_handle_preemption(struct mp_vdpau_ctx *ctx, uint64_t *counter);
@@ -93,6 +102,8 @@ bool mp_vdpau_get_rgb_format(int imgfmt, VdpRGBAFormat *out_rgba_format);
 
 struct mp_image *mp_vdpau_upload_video_surface(struct mp_vdpau_ctx *ctx,
                                                struct mp_image *mpi);
+
+struct mp_vdpau_ctx *mp_vdpau_get_ctx_from_av(struct AVBufferRef *hw_device_ctx);
 
 bool mp_vdpau_guess_if_emulated(struct mp_vdpau_ctx *ctx);
 

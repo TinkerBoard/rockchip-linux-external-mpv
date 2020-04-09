@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MP_CHMAP_H
@@ -22,7 +22,7 @@
 #include <stdbool.h>
 #include "misc/bstr.h"
 
-#define MP_NUM_CHANNELS 8
+#define MP_NUM_CHANNELS 16
 
 // Speaker a channel can be assigned to.
 // This corresponds to WAVEFORMATEXTENSIBLE channel mask bit indexes.
@@ -47,7 +47,7 @@ enum mp_speaker_id {
     MP_SPEAKER_ID_TBL,          // TOP_BACK_LEFT
     MP_SPEAKER_ID_TBC,          // TOP_BACK_CENTER
     MP_SPEAKER_ID_TBR,          // TOP_BACK_RIGHT
-     // Inofficial/libav* extensions
+     // Unofficial/libav* extensions
     MP_SPEAKER_ID_DL = 29,      // STEREO_LEFT (stereo downmix special speakers)
     MP_SPEAKER_ID_DR,           // STEREO_RIGHT
     MP_SPEAKER_ID_WL,           // WIDE_LEFT
@@ -108,10 +108,6 @@ void mp_chmap_fill_na(struct mp_chmap *map, int num);
 
 void mp_chmap_from_channels(struct mp_chmap *dst, int num_channels);
 void mp_chmap_set_unknown(struct mp_chmap *dst, int num_channels);
-void mp_chmap_from_channels_alsa(struct mp_chmap *dst, int num_channels);
-
-void mp_chmap_remove_useless_channels(struct mp_chmap *map,
-                                      const struct mp_chmap *requested);
 
 uint64_t mp_chmap_to_lavc(const struct mp_chmap *src);
 uint64_t mp_chmap_to_lavc_unchecked(const struct mp_chmap *src);
@@ -127,6 +123,9 @@ int mp_chmap_diffn(const struct mp_chmap *a, const struct mp_chmap *b);
 
 char *mp_chmap_to_str_buf(char *buf, size_t buf_size, const struct mp_chmap *src);
 #define mp_chmap_to_str(m) mp_chmap_to_str_buf((char[64]){0}, 64, (m))
+
+char *mp_chmap_to_str_hr_buf(char *buf, size_t buf_size, const struct mp_chmap *src);
+#define mp_chmap_to_str_hr(m) mp_chmap_to_str_hr_buf((char[128]){0}, 128, (m))
 
 bool mp_chmap_from_str(struct mp_chmap *dst, bstr src);
 
